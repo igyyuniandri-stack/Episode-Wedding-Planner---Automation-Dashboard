@@ -1,0 +1,3199 @@
+/***************************************
+ * EPISODE SYSTEM - Wedding Planner (Module 1)
+ * Updated: 2026-02-18
+ *
+ * - Configurable via __SETUP (no hardcode operational settings)
+ * - Control Panel: Sidebar + Wide (modeless dialog)
+ * - Quick Status + Diagnostics + Logs (__DIAGNOSTICS)
+ * - Notifications: Toast + Optional Email
+ * - Template Maker: Build/Reset Master Schedule Gantt
+ * - TRUE idempotent sync (create/update/delete/purge duplicates)
+ * - NEW: Selftest (read-only planning + optional calendar write test)
+ *
+ * SECURITY NOTE (UPDATED):
+ * - Allowlist owner tetap hardcoded (anti-tamper).
+ * - EDITOR BEBAS: editor yang diberi akses oleh owner resmi bisa pakai app normal (Control Panel + Sync).
+ * - OWNER-ONLY ACTIONS: Setup Init / Install Trigger / Template Maker / Danger Zone dibatasi hanya allowlisted owner.
+ * - Anti-copy: jika terdeteksi owner file bukan allowlist (hasil make a copy ilegal),
+ *   maka sistem otomatis LOCKDOWN + delete triggers + wipe script (best-effort).
+ ***************************************/
+
+// ==============================
+// VERSION
+// ==============================
+const EP_VERSION = "1.4.6";
+
+// ==============================
+// CORE SHEETS
+// ==============================
+const EP_SETUP_SHEET = "__SETUP";
+const EP_LOG_SHEET = "__DIAGNOSTICS";
+
+// ==============================
+// SECURITY (ANTI-COPY / OWNER ALLOWLIST) - intentionally hardcoded
+// ==============================
+const EP_SECURITY = {
+  // HARDCODE: hanya owner ini yang sah
+  ALLOWED_OWNERS: [
+    "igy.yuniandri@gmail.com",
+    "episode.weddingorganizer@gmail.com"
+  ],
+
+  // installed trigger handler
+  INSTALL_TRIGGER_HANDLER: "episode_onOpenInstalled",
+
+  // persistent lock flags
+  LOCK_KEY: "EP_LOCKED",
+  LOCK_REASON_KEY: "EP_LOCK_REASON",
+  LOCK_TIME_KEY: "EP_LOCK_TIME",
+  WIPE_ATTEMPTED_KEY: "EP_WIPE_ATTEMPTED",
+
+  // misc
+  LAST_ERROR_KEY: "EP_LAST_ERROR",
+  ONLY_ROW_KEY: "EP_ONLY_ROW",
+  LAST_SYNC_TIME_KEY: "EP_LAST_SYNC_TIME",
+  LAST_SYNC_SUMMARY_KEY: "EP_LAST_SYNC_SUMMARY",
+
+  // cache keys
+  OWNERCHK_CACHE_PREFIX: "EP_OWNERCHK_"
+};
+
+// ==============================
+// DEFAULT SETTINGS (__SETUP)
+// ==============================
+const EP_DEFAULT_SETTINGS = [
+  ["APP_NAME", "💍Episode System"],
+  ["COMPANY_LINE", "Episode - Wedding Planner"],
+  ["MENU_LABEL", "💍Episode System"],
+  ["EVENT_PREFIX", "💍 "],
+  ["LOCK_SHEET", "LOCK_SCREEN"],
+  ["TIMEZONE", "Asia/Jakarta"],
+
+  // UI sizing (wide mode)
+  ["UI_WIDE_WIDTH", "1200"],
+  ["UI_WIDE_HEIGHT", "820"],
+
+  // Master Schedule / Gantt
+  ["TIMELINE_SHEET_NAME", "Master Schedule"],
+  ["CALENDAR_ID", ""],                 // empty = default calendar
+  ["CALENDAR_ID_CELL_A1", "D5"],       // optional legacy mirror
+  ["GANTT_FALLBACK_YEAR", String(new Date().getFullYear())],
+
+  ["GANTT_HEADER_KEY", "activity description"], // text in col A
+  ["GANTT_ACTIVITY_COL", "1"],                  // A
+  ["GANTT_DATE_COL_START", "2"],                // B
+  ["GANTT_HEADER_SCAN_MAX_ROWS", "120"],
+  ["GANTT_EMPTY_RUN_STOP", "12"],
+  ["GANTT_WEEKEND_BRIDGE", "TRUE"],
+
+  // optional fixed header row (skip scanning). Empty = auto-scan.
+  ["GANTT_HEADER_ROW", ""],
+
+  // markers
+  ["GANTT_MARKER_REGEX", "^[a-zA-Z]$|^[✓✔●■xX]$"],
+
+  // caps
+  ["MAX_EVENTS_PER_RUN", "450"],
+  ["MAX_DELETE_PER_RUN", "900"],
+
+  // sync scan window (days) around gantt range
+  ["SYNC_RANGE_DAYS_BEFORE", "2"],
+  ["SYNC_RANGE_DAYS_AFTER", "3"],
+
+  // time bracket parsing (timed events only if single-day segment)
+  ["TIMED_BRACKET_REGEX", "\\[(\\d{1,2})[:.](\\d{2})\\s*-\\s*(\\d{1,2})[:.](\\d{2})\\]"],
+
+  // Notifications
+  ["NOTIFY_TOAST", "TRUE"],
+  ["NOTIFY_TOAST_SECONDS", "4"],
+  ["NOTIFY_EMAIL_ENABLED", "FALSE"],
+  ["NOTIFY_EMAIL_TO", "episode.weddingorganizer@gmail.com"],
+  ["NOTIFY_EMAIL_ON_ERROR", "TRUE"],
+  ["NOTIFY_EMAIL_ON_SYNC", "FALSE"],
+
+  // Color rules (first match wins, match:[] = fallback)
+  ["COLOR_RULES_JSON",
+`[
+  {"match":["wedding","hari h","akad","pemberkatan","resepsi"],"color":"ORANGE"},
+  {"match":["bayar","dp","lunas","invoice","term"],"color":"RED"},
+  {"match":["meeting","tm","ketemu","visit","survey"],"color":"YELLOW"},
+  {"match":[],"color":"BLUE"}
+]`],
+
+  // Reminder rules (minutes popup) (first match wins, match:[] = fallback)
+  ["REMINDER_RULES_JSON",
+`[
+  {"match":["wedding","hari h","akad","pemberkatan","resepsi"],"minutes":[10080,4320,1440,360]},
+  {"match":[],"minutes":[10080,4320,1440]}
+]`],
+
+  // Template Maker defaults
+  ["TPL_DEFAULT_DAYS", "180"],
+  ["TPL_INCLUDE_SAMPLE_TASKS", "TRUE"],
+
+  // Template header row
+  ["TPL_HEADER_ROW", "10"],
+
+  // Hashing mode (migration-friendly)
+  // V1 = legacy behavior (default, safest if sudah ada event lama)
+  // V2 = timezone-stable hashing (recommended kalau sering ganti timezone/locale)
+  ["HASH_VERSION", "V1"],
+  ["HASH_COMPAT_ACCEPT_V1", "TRUE"],
+  ["HASH_COMPAT_ACCEPT_V2", "TRUE"],
+
+  // Diagnostics log trimming
+  ["LOG_MAX_ROWS", "8000"],
+  ["LOG_TRIM_BUFFER", "500"],
+
+  // SELFTEST settings
+  ["SELFTEST_CALENDAR_WRITE", "FALSE"],
+  ["SELFTEST_DRYRUN_PLAN_SYNC", "TRUE"],
+  ["SELFTEST_MAX_TASK_ROWS_SCAN", "1500"],
+  ["SELFTEST_EVENT_TITLE", "Episode Selftest (auto-delete)"]
+];
+
+// ==============================
+// HTML INCLUDE HELPER (for Sidebar.html templating)
+// ==============================
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+// ==============================
+// BASIC STRING / ID HELPERS
+// ==============================
+function epi_norm_(s) { return String(s || "").toLowerCase().trim(); }
+
+function epi_getContainerFileId_() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    return ss ? ss.getId() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function epi_isAllowedEmail_(email) {
+  const allowed = EP_SECURITY.ALLOWED_OWNERS.map(x => epi_norm_(x));
+  const e = epi_norm_(email);
+  return !!(e && allowed.includes(e));
+}
+
+function epi_getCallerEmail_() {
+  let eff = "", act = "";
+  try { eff = Session.getEffectiveUser().getEmail() || ""; } catch (e) {}
+  try { act = Session.getActiveUser().getEmail() || ""; } catch (e) {}
+  return { effective: String(eff || ""), active: String(act || "") };
+}
+
+function epi_getCallerPrimaryEmail_() {
+  const who = epi_getCallerEmail_();
+  const picked = epi_norm_(who.effective || who.active);
+  return picked || "";
+}
+
+function epi_isAllowlistedCaller_() {
+  const picked = epi_getCallerPrimaryEmail_();
+  return epi_isAllowedEmail_(picked);
+}
+
+/**
+ * Owner-only gate untuk aksi berbahaya.
+ * Catatan: ini membatasi "siapa yang menjalankan", bukan ownership file.
+ */
+function epi_requireAllowlistedUser_() {
+  const user = epi_getCallerPrimaryEmail_();
+  if (!epi_isAllowedEmail_(user)) {
+    throw new Error(
+      "Aksi ini dibatasi hanya untuk owner resmi.\n\n" +
+      "Jika kamu editor, kamu tetap bisa pakai Control Panel dan Sync.\n" +
+      "Untuk Setup/Install/Template/Danger Zone, minta owner resmi yang jalankan."
+    );
+  }
+}
+
+// ==============================
+// SECURITY GUARD (LOCK + OWNER CHECK)
+// ==============================
+function epi_isLocked_() {
+  try {
+    return PropertiesService.getScriptProperties().getProperty(EP_SECURITY.LOCK_KEY) === "1";
+  } catch (e) {
+    return false;
+  }
+}
+
+function epi_getLockInfo_() {
+  try {
+    const sp = PropertiesService.getScriptProperties();
+    return {
+      locked: sp.getProperty(EP_SECURITY.LOCK_KEY) === "1",
+      reason: String(sp.getProperty(EP_SECURITY.LOCK_REASON_KEY) || ""),
+      time: String(sp.getProperty(EP_SECURITY.LOCK_TIME_KEY) || "")
+    };
+  } catch (e) {
+    return { locked: false, reason: "", time: "" };
+  }
+}
+
+function epi_setLock_(reason) {
+  const sp = PropertiesService.getScriptProperties();
+  sp.setProperty(EP_SECURITY.LOCK_KEY, "1");
+  sp.setProperty(EP_SECURITY.LOCK_REASON_KEY, String(reason || "").slice(0, 8000));
+  sp.setProperty(EP_SECURITY.LOCK_TIME_KEY, new Date().toISOString());
+}
+
+function epi_deleteAllTriggers_() {
+  try {
+    ScriptApp.getProjectTriggers().forEach(t => {
+      try { ScriptApp.deleteTrigger(t); } catch (e) {}
+    });
+  } catch (e) {}
+}
+
+function epi_securityGuard_() {
+  // 1) If already locked -> stop everything
+  if (epi_isLocked_()) {
+    const info = epi_getLockInfo_();
+    throw new Error(
+      "APP LOCKED.\n\n" +
+      (info.time ? ("Locked at: " + info.time + "\n") : "") +
+      (info.reason ? ("Reason:\n" + info.reason) : "Reason: (not recorded)")
+    );
+  }
+
+  // 2) Verify ownership
+  const chk = epi_getOwnerAllowCheck_();
+
+  // If we cannot read owner (Drive scope not authorized), block without wiping.
+  if (chk.status === "UNREADABLE") {
+    throw new Error(
+      "OWNER CHECK UNAVAILABLE.\n\n" +
+      "Sistem perlu bisa membaca owner file via Drive untuk verifikasi lisensi.\n" +
+      "Jalankan dari menu/sidebar lalu izinkan akses saat diminta.\n\n" +
+      "Detail:\n" + (chk.error || "(no detail)")
+    );
+  }
+
+  // If untrusted owner -> lockdown + wipe best-effort.
+  if (!chk.ok) {
+    const reason =
+      "UNAUTHORIZED FILE OWNER (possible illegal copy).\n" +
+      `containerOwner=${chk.containerOwnerEmail || "(unreadable)"}\n` +
+      `scriptOwner=${chk.scriptOwnerEmail || "(unreadable)"}\n` +
+      (chk.error ? ("detail=" + chk.error) : "");
+
+    epi_lockdownAndWipe_(reason);
+    throw new Error("APP LOCKED (UNTRUSTED OWNER).");
+  }
+
+  return true;
+}
+
+// Owner allowlist check helpers (cached)
+function epi_getOwnerAllowCheck_() {
+  const containerId = epi_getContainerFileId_();
+  const cache = CacheService.getScriptCache();
+
+  // cache by container file id (copy -> id berubah -> cache miss)
+  const cacheKey = EP_SECURITY.OWNERCHK_CACHE_PREFIX + String(containerId || "NO_CONTAINER");
+  if (containerId) {
+    try {
+      const cached = cache.get(cacheKey);
+      if (cached) {
+        const obj = JSON.parse(cached);
+        if (obj && typeof obj === "object" && obj.status) return obj;
+      }
+    } catch (e) {}
+  }
+
+  let containerOwnerEmail = "";
+  let scriptOwnerEmail = "";
+  let containerErr = "";
+  let scriptErr = "";
+
+  // Container (Spreadsheet) owner
+  if (containerId) {
+    try {
+      const owner = DriveApp.getFileById(containerId).getOwner();
+      containerOwnerEmail = owner ? String(owner.getEmail() || "").trim() : "";
+    } catch (e) {
+      containerErr = "Container owner check failed: " + (e && e.message ? e.message : e);
+    }
+  }
+
+  // Script project owner
+  try {
+    const scriptFile = DriveApp.getFileById(ScriptApp.getScriptId());
+    const owner = scriptFile ? scriptFile.getOwner() : null;
+    scriptOwnerEmail = owner ? String(owner.getEmail() || "").trim() : "";
+  } catch (e) {
+    scriptErr = "Script owner check failed: " + (e && e.message ? e.message : e);
+  }
+
+  // Decision:
+  // - If container owner readable -> MUST be allowlisted.
+  // - Else fallback to script owner.
+  // - If none readable -> UNREADABLE.
+  let result;
+
+  if (containerOwnerEmail) {
+    const ok = epi_isAllowedEmail_(containerOwnerEmail);
+    result = {
+      ok,
+      status: ok ? "OK" : "UNTRUSTED",
+      containerOwnerEmail,
+      scriptOwnerEmail,
+      error: containerErr || scriptErr
+    };
+  } else if (scriptOwnerEmail) {
+    const ok = epi_isAllowedEmail_(scriptOwnerEmail);
+    result = {
+      ok,
+      status: ok ? "OK" : "UNTRUSTED",
+      containerOwnerEmail: "",
+      scriptOwnerEmail,
+      error: containerErr || scriptErr
+    };
+  } else {
+    result = {
+      ok: false,
+      status: "UNREADABLE",
+      containerOwnerEmail: "",
+      scriptOwnerEmail: "",
+      error: containerErr || scriptErr || "Owner unreadable"
+    };
+  }
+
+  // cache only if readable decision (OK/UNTRUSTED). Jangan cache UNREADABLE biar setelah authorize bisa langsung valid.
+  try {
+    if (containerId && result.status !== "UNREADABLE") {
+      cache.put(cacheKey, JSON.stringify(result), 600); // 10 menit
+    }
+  } catch (e) {}
+
+  return result;
+}
+
+/**
+ * Best-effort wipe script content using Apps Script API projects.updateContent.
+ * Requirements:
+ * - Enable Google Apps Script API in Google Cloud project.
+ * - Add OAuth scope: https://www.googleapis.com/auth/script.projects
+ */
+function epi_tryWipeProjectContent_() {
+  const sp = PropertiesService.getScriptProperties();
+  if (sp.getProperty(EP_SECURITY.WIPE_ATTEMPTED_KEY) === "1") return;
+  sp.setProperty(EP_SECURITY.WIPE_ATTEMPTED_KEY, "1");
+
+  const scriptId = ScriptApp.getScriptId();
+  const url = `https://script.googleapis.com/v1/projects/${encodeURIComponent(scriptId)}/content`;
+
+  const stubSource =
+`function onOpen(e){
+  try {
+    var ss = SpreadsheetApp.getActive();
+    ss.toast("App terkunci. Hubungi owner resmi.", "LOCKED", 10);
+  } catch (err) {}
+}
+function __LOCKED__(){
+  throw new Error("LOCKED");
+}`;
+
+  const manifest =
+`{
+  "timeZone": "Asia/Jakarta",
+  "exceptionLogging": "CLOUD"
+}`;
+
+  const payload = {
+    files: [
+      { name: "appsscript", type: "JSON", source: manifest },
+      { name: "Main", type: "SERVER_JS", source: stubSource }
+    ]
+  };
+
+  try {
+    UrlFetchApp.fetch(url, {
+      method: "put",
+      contentType: "application/json",
+      payload: JSON.stringify(payload),
+      headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    // Ignore - lockdown already applied
+  }
+}
+
+function epi_lockdownAndWipe_(reason) {
+  try { epi_setLock_(reason); } catch (e) {}
+
+  try { epi_deleteAllTriggers_(); } catch (e) {}
+
+  try { activateLockdown_(reason); } catch (e) {}
+
+  try { epi_tryWipeProjectContent_(); } catch (e) {}
+}
+
+// ==============================
+// SAFE UI + ERROR STORAGE
+// ==============================
+function epi_safeUi_() {
+  try { return SpreadsheetApp.getUi(); } catch (e) { return null; }
+}
+
+function epi_alertSafe_(title, msg) {
+  const ui = epi_safeUi_();
+  if (!ui) { console.log(String(title || "") + "\n" + String(msg || "")); return; }
+  ui.alert(String(title || ""), String(msg || ""), ui.ButtonSet.OK);
+}
+
+function epi_setLastError_(text) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(
+      EP_SECURITY.LAST_ERROR_KEY,
+      String(text || "").slice(0, 8000)
+    );
+  } catch (e) {}
+}
+
+function epi_getLastError_() {
+  try { return String(PropertiesService.getScriptProperties().getProperty(EP_SECURITY.LAST_ERROR_KEY) || "").trim(); }
+  catch (e) { return ""; }
+}
+
+// ==============================
+// SETUP SHEET + LOG SHEET (CREATORS)
+// ==============================
+function epi_defaultCfgMap_() {
+  const cfg = {};
+  for (let i = 0; i < EP_DEFAULT_SETTINGS.length; i++) {
+    const k = String(EP_DEFAULT_SETTINGS[i][0] || "").trim();
+    if (!k) continue;
+    cfg[k] = EP_DEFAULT_SETTINGS[i][1];
+  }
+  return cfg;
+}
+
+function epi_getSetupSheet_(ensure) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(EP_SETUP_SHEET);
+
+  if (!sh && ensure) {
+    sh = ss.insertSheet(EP_SETUP_SHEET);
+    sh.getRange(1, 1, 1, 2).setValues([["KEY", "VALUE"]]).setFontWeight("bold");
+    sh.getRange(2, 1, EP_DEFAULT_SETTINGS.length, 2).setValues(EP_DEFAULT_SETTINGS);
+    sh.setFrozenRows(1);
+    sh.autoResizeColumns(1, 2);
+  } else if (sh && ensure) {
+    epi_setupEnsureKeys_(sh, EP_DEFAULT_SETTINGS);
+  }
+
+  return sh || null;
+}
+
+function epi_setupEnsureKeys_(setupSheet, defaultPairs) {
+  try {
+    const values = setupSheet.getDataRange().getValues();
+    const existing = {};
+    for (let i = 1; i < values.length; i++) {
+      const k = String(values[i][0] || "").trim();
+      if (k) existing[k] = true;
+    }
+    const toAppend = [];
+    for (let i = 0; i < defaultPairs.length; i++) {
+      const k = String(defaultPairs[i][0] || "").trim();
+      if (k && !existing[k]) toAppend.push(defaultPairs[i]);
+    }
+    if (toAppend.length) {
+      setupSheet.getRange(setupSheet.getLastRow() + 1, 1, toAppend.length, 2).setValues(toAppend);
+      setupSheet.autoResizeColumns(1, 2);
+    }
+  } catch (e) {}
+}
+
+function epi_ensureLogSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(EP_LOG_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(EP_LOG_SHEET);
+    sh.getRange(1, 1, 1, 6).setValues([[
+      "Timestamp (Asia/Jakarta)", "Level", "Code", "Message", "Context(JSON)", "Stack"
+    ]]).setFontWeight("bold");
+    sh.setFrozenRows(1);
+    sh.autoResizeColumns(1, 6);
+  }
+  return sh;
+}
+
+// ==============================
+// CONFIG LOADER (from __SETUP)
+// ==============================
+function epi_cfgRaw_(ensure) {
+  const sh = epi_getSetupSheet_(!!ensure);
+  if (!sh) return epi_defaultCfgMap_();
+
+  const values = sh.getDataRange().getValues();
+  const cfg = {};
+  for (let i = 1; i < values.length; i++) {
+    const k = String(values[i][0] || "").trim();
+    if (!k) continue;
+    cfg[k] = values[i][1];
+  }
+
+  // fallback to defaults for missing keys (non-destructive)
+  const d = epi_defaultCfgMap_();
+  Object.keys(d).forEach(k => {
+    if (!(k in cfg)) cfg[k] = d[k];
+  });
+
+  return cfg;
+}
+
+function epi_cfg_(ensure) {
+  const raw = epi_cfgRaw_(ensure !== false); // default ensure true
+  const cfg = {};
+  Object.keys(raw).forEach(k => cfg[k] = raw[k]);
+
+  cfg.TIMEZONE = String(cfg.TIMEZONE || "Asia/Jakarta").trim() || "Asia/Jakarta";
+
+  cfg.TIMELINE_SHEET_NAME = String(cfg.TIMELINE_SHEET_NAME || "Master Schedule").trim() || "Master Schedule";
+  cfg.CALENDAR_ID = String(cfg.CALENDAR_ID || "").trim();
+  cfg.CALENDAR_ID_CELL_A1 = String(cfg.CALENDAR_ID_CELL_A1 || "D5").trim() || "D5";
+
+  cfg.GANTT_FALLBACK_YEAR = epi_toNum_(cfg.GANTT_FALLBACK_YEAR, new Date().getFullYear());
+  cfg.GANTT_HEADER_KEY = String(cfg.GANTT_HEADER_KEY || "activity description").trim().toLowerCase();
+  cfg.GANTT_ACTIVITY_COL = epi_toNum_(cfg.GANTT_ACTIVITY_COL, 1);
+  cfg.GANTT_DATE_COL_START = epi_toNum_(cfg.GANTT_DATE_COL_START, 2);
+  cfg.GANTT_HEADER_SCAN_MAX_ROWS = epi_toNum_(cfg.GANTT_HEADER_SCAN_MAX_ROWS, 120);
+  cfg.GANTT_EMPTY_RUN_STOP = epi_toNum_(cfg.GANTT_EMPTY_RUN_STOP, 12);
+  cfg.GANTT_WEEKEND_BRIDGE = epi_toBool_(cfg.GANTT_WEEKEND_BRIDGE, true);
+
+  cfg.GANTT_HEADER_ROW = String(cfg.GANTT_HEADER_ROW || "").trim();
+  cfg.GANTT_HEADER_ROW_NUM = cfg.GANTT_HEADER_ROW ? epi_toNum_(cfg.GANTT_HEADER_ROW, -1) : -1;
+
+  cfg.MAX_EVENTS_PER_RUN = epi_toNum_(cfg.MAX_EVENTS_PER_RUN, 450);
+  cfg.MAX_DELETE_PER_RUN = epi_toNum_(cfg.MAX_DELETE_PER_RUN, 900);
+
+  cfg.SYNC_RANGE_DAYS_BEFORE = epi_toNum_(cfg.SYNC_RANGE_DAYS_BEFORE, 2);
+  cfg.SYNC_RANGE_DAYS_AFTER = epi_toNum_(cfg.SYNC_RANGE_DAYS_AFTER, 3);
+
+  cfg.NOTIFY_TOAST = epi_toBool_(cfg.NOTIFY_TOAST, true);
+  cfg.NOTIFY_TOAST_SECONDS = epi_toNum_(cfg.NOTIFY_TOAST_SECONDS, 4);
+
+  cfg.NOTIFY_EMAIL_ENABLED = epi_toBool_(cfg.NOTIFY_EMAIL_ENABLED, false);
+  cfg.NOTIFY_EMAIL_TO = String(cfg.NOTIFY_EMAIL_TO || "").trim();
+  cfg.NOTIFY_EMAIL_ON_ERROR = epi_toBool_(cfg.NOTIFY_EMAIL_ON_ERROR, true);
+  cfg.NOTIFY_EMAIL_ON_SYNC = epi_toBool_(cfg.NOTIFY_EMAIL_ON_SYNC, false);
+
+  cfg.UI_WIDE_WIDTH = epi_toNum_(cfg.UI_WIDE_WIDTH, 1200);
+  cfg.UI_WIDE_HEIGHT = epi_toNum_(cfg.UI_WIDE_HEIGHT, 820);
+
+  cfg.TPL_DEFAULT_DAYS = epi_toNum_(cfg.TPL_DEFAULT_DAYS, 180);
+  cfg.TPL_INCLUDE_SAMPLE_TASKS = epi_toBool_(cfg.TPL_INCLUDE_SAMPLE_TASKS, true);
+  cfg.TPL_HEADER_ROW = epi_toNum_(cfg.TPL_HEADER_ROW, 10);
+
+  // Hashing
+  cfg.HASH_VERSION = String(cfg.HASH_VERSION || "V1").trim().toUpperCase() || "V1";
+  if (!["V1", "V2"].includes(cfg.HASH_VERSION)) cfg.HASH_VERSION = "V1";
+  cfg.HASH_COMPAT_ACCEPT_V1 = epi_toBool_(cfg.HASH_COMPAT_ACCEPT_V1, true);
+  cfg.HASH_COMPAT_ACCEPT_V2 = epi_toBool_(cfg.HASH_COMPAT_ACCEPT_V2, true);
+
+  // Logging trim
+  cfg.LOG_MAX_ROWS = epi_toNum_(cfg.LOG_MAX_ROWS, 8000);
+  cfg.LOG_TRIM_BUFFER = epi_toNum_(cfg.LOG_TRIM_BUFFER, 500);
+
+  // SELFTEST
+  cfg.SELFTEST_CALENDAR_WRITE = epi_toBool_(cfg.SELFTEST_CALENDAR_WRITE, false);
+  cfg.SELFTEST_DRYRUN_PLAN_SYNC = epi_toBool_(cfg.SELFTEST_DRYRUN_PLAN_SYNC, true);
+  cfg.SELFTEST_MAX_TASK_ROWS_SCAN = epi_toNum_(cfg.SELFTEST_MAX_TASK_ROWS_SCAN, 1500);
+  cfg.SELFTEST_EVENT_TITLE = String(cfg.SELFTEST_EVENT_TITLE || "Episode Selftest (auto-delete)").trim() || "Episode Selftest (auto-delete)";
+
+  // regex
+  cfg.GANTT_MARKER_REGEX_STR = String(cfg.GANTT_MARKER_REGEX || "^[a-zA-Z]$|^[✓✔●■xX]$");
+  cfg.GANTT_MARKER_REGEX_RE = epi_safeRegex_(cfg.GANTT_MARKER_REGEX_STR, /^[a-zA-Z]$|^[✓✔●■xX]$/);
+
+  cfg.TIMED_BRACKET_REGEX_STR = String(cfg.TIMED_BRACKET_REGEX || "\\[(\\d{1,2})[:.](\\d{2})\\s*-\\s*(\\d{1,2})[:.](\\d{2})\\]");
+  cfg.TIMED_BRACKET_REGEX_RE = epi_safeRegex_(cfg.TIMED_BRACKET_REGEX_STR, /\[(\d{1,2})[:.](\d{2})\s*-\s*(\d{1,2})[:.](\d{2})\]/);
+
+  // JSON rules
+  cfg.COLOR_RULES = epi_safeJsonArray_(cfg.COLOR_RULES_JSON, []);
+  cfg.REMINDER_RULES = epi_safeJsonArray_(cfg.REMINDER_RULES_JSON, []);
+
+  cfg.APP_NAME = String(cfg.APP_NAME || "Episode System").trim() || "Episode System";
+  cfg.COMPANY_LINE = String(cfg.COMPANY_LINE || "Episode - Wedding Planner").trim() || "Episode - Wedding Planner";
+  cfg.MENU_LABEL = String(cfg.MENU_LABEL || "Episode System").trim() || "Episode System";
+  cfg.EVENT_PREFIX = String(cfg.EVENT_PREFIX || "💍 ").toString();
+
+  cfg.LOCK_SHEET = String(cfg.LOCK_SHEET || "LOCK_SCREEN").trim() || "LOCK_SCREEN";
+
+  return cfg;
+}
+
+function epi_toBool_(v, def) {
+  const s = String(v === undefined || v === null ? "" : v).trim().toUpperCase();
+  if (s === "TRUE") return true;
+  if (s === "FALSE") return false;
+  return !!def;
+}
+
+function epi_toNum_(v, def) {
+  const n = parseInt(String(v === undefined || v === null ? "" : v).replace(/[^0-9-]/g, ""), 10);
+  if (isNaN(n)) return def;
+  return n;
+}
+
+function epi_safeRegex_(pattern, fallbackRe) {
+  try {
+    const s = String(pattern || "").trim();
+    if (!s) return fallbackRe;
+
+    if (s.startsWith("/") && s.lastIndexOf("/") > 0) {
+      const last = s.lastIndexOf("/");
+      const body = s.slice(1, last);
+      const flags = s.slice(last + 1);
+      return new RegExp(body, flags);
+    }
+    return new RegExp(s);
+  } catch (e) {
+    return fallbackRe;
+  }
+}
+
+function epi_safeJsonArray_(raw, fallbackArr) {
+  try {
+    const s = String(raw || "").trim();
+    if (!s) return fallbackArr;
+    const v = JSON.parse(s);
+    return Array.isArray(v) ? v : fallbackArr;
+  } catch (e) {
+    return fallbackArr;
+  }
+}
+
+// ==============================
+// MENU
+// ==============================
+function onOpen(e) {
+  // Build menu regardless, but block actions via epi_securityGuard_()
+  episode_buildMenu_();
+
+  // Attempt early lockdown if possible (best-effort)
+  try {
+    epi_securityGuard_();
+  } catch (err) {
+    // If untrusted owner, guard already triggered lockdown.
+    // If unreadable, user will see error when running actions (and can authorize).
+  }
+}
+
+function episode_buildMenu_() {
+  const ui = epi_safeUi_();
+  if (!ui) return;
+
+  // Menu config: jangan memodifikasi file saat onOpen (ensure=false)
+  const cfg = epi_cfg_(false);
+  const isOwnerUser = epi_isAllowlistedCaller_();
+
+  const menu = ui.createMenu(cfg.MENU_LABEL || "Episode System");
+
+  menu.addItem("🧩 Open Control Panel (Sidebar)", "episode_openControlPanel");
+  menu.addItem("🖥️ Open Control Panel (Wide)", "episode_openControlPanelWide");
+  menu.addSeparator();
+
+  // Setup menu (owner-only untuk init/install; calendar id untuk semua)
+  const setupMenu = ui.createMenu("Setup");
+  if (isOwnerUser) setupMenu.addItem("🧱 Initialize / Reset Setup (__SETUP)", "episode_setupInit");
+  if (isOwnerUser) setupMenu.addItem("✅ Install (Recommended)", "episode_install");
+
+  // NEW: Calendar ID prompt (good UX modal)
+  setupMenu.addItem("🗓️ Google Calendar ID", "episode_openCalendarIdDialog");
+
+  // Tetap ada untuk OAuth prompt write access
+  setupMenu.addItem("🔑 Authorize Calendar (Write Test)", "episode_authorizeCalendarWritePrompt");
+  menu.addSubMenu(setupMenu);
+
+  // Sync menu tetap tampil
+  menu.addSubMenu(
+    ui.createMenu("Sync")
+      .addItem("📅 Sync All (Gantt)", "syncTasksToCalendar")
+      .addItem("🎯 Sync Selected Row (Gantt)", "episode_syncSelectedRow")
+      .addItem("🔢 Sync Row by Number (Gantt)", "episode_syncRowByPrompt")
+  );
+
+  // HAPUS dari toolbar: Diagnostics + Template Maker (akses via Control Panel saja)
+  // (fungsi tetap ada, cuma tidak ditampilkan di menu)
+
+  // Danger Zone hanya tampil untuk owner allowlist
+  if (isOwnerUser) {
+    menu.addSubMenu(
+      ui.createMenu("Danger Zone")
+        .addItem("🔓 Dev: Unlock All Sheets", "dev_UnlockAllSheets")
+    );
+  }
+
+  menu.addToUi();
+}
+
+// ==============================
+// NEW: Calendar ID Dialog (Modal) - Good UI/UX
+// ==============================
+function episode_openCalendarIdDialog() {
+  epi_securityGuard_();
+
+  const ui = epi_safeUi_();
+  if (!ui) throw new Error("Buka dari Google Sheets untuk membuka dialog.");
+
+  const cfg = epi_cfg_();
+  const current = String(cfg.CALENDAR_ID || "").trim();
+  const tz = String(cfg.TIMEZONE || "Asia/Jakarta").trim() || "Asia/Jakarta";
+
+  // best-effort info default calendar
+  let defaultName = "Default Calendar";
+  try {
+    const def = CalendarApp.getDefaultCalendar();
+    if (def) defaultName = def.getName();
+  } catch (e) {}
+
+  const esc = (s) => String(s || "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+
+  const html = HtmlService.createHtmlOutput(`
+<!doctype html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8"/>
+  <style>
+    body{
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      margin: 0; background:#0b0b0f; color:#eaeaf2;
+    }
+    .wrap{ padding:18px 18px 14px; }
+    .title{ font-size:16px; font-weight:700; margin:0 0 6px; letter-spacing:.2px;}
+    .sub{ font-size:12.5px; color:#b7b7c9; margin:0 0 14px; line-height:1.4;}
+    .card{
+      background:#141422; border:1px solid rgba(255,255,255,.08);
+      border-radius:14px; padding:14px; box-shadow:0 10px 30px rgba(0,0,0,.35);
+    }
+    label{ font-size:12px; color:#cfcfe6; display:block; margin:0 0 6px; }
+    input{
+      width:100%; padding:11px 12px; border-radius:10px;
+      border:1px solid rgba(255,255,255,.10);
+      background:#0f0f18; color:#fff; outline:none;
+      font-size:13px;
+    }
+    input:focus{ border-color: rgba(79,70,229,.55); box-shadow: 0 0 0 3px rgba(79,70,229,.18); }
+    .hint{ font-size:12px; color:#a7a7c2; margin:10px 0 0; line-height:1.45; }
+    .row{ display:flex; gap:10px; margin-top:12px; flex-wrap:wrap; }
+    .btn{
+      border:1px solid rgba(255,255,255,.12);
+      background:#1a1a2b; color:#fff;
+      padding:10px 12px; border-radius:12px;
+      cursor:pointer; font-size:12.5px; font-weight:600;
+      transition: transform .06s ease, background .15s ease;
+      user-select:none;
+    }
+    .btn:hover{ background:#23233a; }
+    .btn:active{ transform: translateY(1px); }
+    .btn.primary{ background:#4f46e5; border-color: rgba(79,70,229,.55); }
+    .btn.primary:hover{ background:#5b54f0; }
+    .btn.ghost{ background:transparent; }
+    .btn.danger{ background:#2a1116; border-color: rgba(255,70,70,.25); color:#ffd2d2; }
+    .status{
+      margin-top:12px; padding:10px 12px; border-radius:12px;
+      background:#0f0f18; border:1px solid rgba(255,255,255,.08);
+      font-size:12.5px; color:#cfcfe6; min-height:18px;
+      white-space:pre-wrap;
+    }
+    .meta{
+      margin-top:10px; font-size:11.5px; color:#9a9ab7;
+      display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap;
+    }
+    .pill{
+      display:inline-block; padding:5px 9px; border-radius:999px;
+      background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.08);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">Set Google Calendar ID</div>
+    <div class="sub">
+      Isi <b>Calendar ID</b> yang mau dipakai untuk sync. Kosong = pakai <b>default calendar</b>.
+      Ini bukan “nama kalender”, tapi ID-nya (biasanya format email atau <span class="pill">@group.calendar.google.com</span>).
+    </div>
+
+    <div class="card">
+      <label for="calid">Google Calendar ID</label>
+      <input id="calid" placeholder="contoh: abcdef123456@group.calendar.google.com" value="${esc(current)}"/>
+
+      <div class="hint">
+        Cara ambil Calendar ID: Google Calendar → Settings &amp; sharing → bagian <b>Integrate calendar</b> → <b>Calendar ID</b>.<br/>
+        Kalau kamu mau pakai kalender utama akun kamu, tinggal kosongin saja.
+      </div>
+
+      <div class="row">
+        <button class="btn" onclick="useDefault()">Use Default</button>
+        <button class="btn" onclick="doTest()">Test Access</button>
+        <div style="flex:1"></div>
+        <button class="btn ghost" onclick="google.script.host.close()">Cancel</button>
+        <button class="btn primary" onclick="doSave()">Save</button>
+      </div>
+
+      <div id="status" class="status">Current: ${esc(current ? current : "(default: " + defaultName + ")")}</div>
+
+      <div class="meta">
+        <span class="pill">Timezone: ${esc(tz)}</span>
+        <span class="pill">Setting key: CALENDAR_ID</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (t) => { $("status").textContent = t || ""; };
+
+    function norm(v){
+      v = (v || "").trim();
+      if (v.toLowerCase() === "primary") return ""; // biar tidak bikin bingung
+      return v;
+    }
+
+    function useDefault(){
+      $("calid").value = "";
+      setStatus("Default selected. Click Save to apply.");
+    }
+
+    function doTest(){
+      const id = norm($("calid").value);
+      setStatus("Testing access…");
+      google.script.run
+        .withSuccessHandler((res) => {
+          if (!res) { setStatus("Test failed: empty response."); return; }
+          if (res.ok) {
+            setStatus("✅ OK\\nCalendar: " + (res.name || "(unknown)") + "\\nID: " + (res.id || "(default)"));
+          } else {
+            setStatus("❌ Not accessible\\n" + (res.message || "Calendar ID invalid / tidak bisa diakses."));
+          }
+        })
+        .withFailureHandler((err) => {
+          setStatus("❌ Error\\n" + (err && err.message ? err.message : err));
+        })
+        .episode_calendarIdTest(id);
+    }
+
+    function doSave(){
+      const id = norm($("calid").value);
+      setStatus("Saving…");
+      google.script.run
+        .withSuccessHandler((res) => {
+          if (!res) { setStatus("Save failed: empty response."); return; }
+          if (res.ok) {
+            setStatus("✅ Saved\\nCalendar: " + (res.name || "(unknown)") + "\\nID: " + (res.id || "(default)"));
+            setTimeout(() => google.script.host.close(), 650);
+          } else {
+            setStatus("❌ Not saved\\n" + (res.message || "Unknown issue"));
+          }
+        })
+        .withFailureHandler((err) => {
+          setStatus("❌ Error\\n" + (err && err.message ? err.message : err));
+        })
+        .episode_calendarIdSave(id);
+    }
+  </script>
+</body>
+</html>
+  `)
+  .setWidth(560)
+  .setHeight(430);
+
+  ui.showModalDialog(html, (cfg.APP_NAME || "Episode") + " — Google Calendar ID");
+}
+
+function episode_calendarIdTest(idRaw) {
+  epi_securityGuard_();
+
+  const cfg = epi_cfg_();
+  const id = String(idRaw || "").trim();
+  if (!id) {
+    // default calendar test
+    try {
+      const cal = CalendarApp.getDefaultCalendar();
+      if (!cal) return { ok: false, message: "Default calendar tidak bisa diakses." };
+      return { ok: true, id: "", name: cal.getName() };
+    } catch (e) {
+      return { ok: false, message: (e && e.message) ? e.message : String(e) };
+    }
+  }
+
+  try {
+    const cal = CalendarApp.getCalendarById(id);
+    if (!cal) return { ok: false, message: "Calendar ID tidak valid / tidak punya akses." };
+    return { ok: true, id, name: cal.getName() };
+  } catch (e) {
+    return { ok: false, message: (e && e.message) ? e.message : String(e) };
+  }
+}
+
+function episode_calendarIdSave(idRaw) {
+  epi_securityGuard_();
+
+  const cfg = epi_cfg_();
+  let id = String(idRaw || "").trim();
+  if (id.toLowerCase() === "primary") id = ""; // biar konsisten: empty = default
+
+  // validate first
+  const test = episode_calendarIdTest(id);
+  if (!test || !test.ok) {
+    return { ok: false, message: (test && test.message) ? test.message : "Calendar ID tidak bisa diakses." };
+  }
+
+  // Save to __SETUP using smart patch (allow empty)
+  try {
+    const saved = epi_ui_saveSettings({ CALENDAR_ID: id }, { forceEmpty: true });
+
+    // optional legacy mirror (kalau Master Schedule ada)
+    try {
+      const cfg2 = epi_cfg_(); // after save
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const sh = ss.getSheetByName(cfg2.TIMELINE_SHEET_NAME);
+      if (sh && cfg2.CALENDAR_ID_CELL_A1) {
+        sh.getRange(cfg2.CALENDAR_ID_CELL_A1).setValue(id || "");
+      }
+    } catch (e) {}
+
+    return { ok: true, id: id || "", name: test.name || "", saved };
+  } catch (e) {
+    const msg = (e && e.message) ? e.message : String(e);
+    epi_setLastError_("Save Calendar ID failed:\n" + msg);
+    return { ok: false, message: msg };
+  }
+}
+
+function episode_ownerOnlyHint() {
+  epi_securityGuard_();
+  epi_requireAllowlistedUser_(); // akan throw dengan message yang jelas
+  return "OK";
+}
+
+// ==============================
+// UI OPENERS
+// ==============================
+function episode_openControlPanel() {
+  epi_securityGuard_();
+
+  const ui = epi_safeUi_();
+  if (!ui) throw new Error("Buka dari Google Sheets untuk membuka sidebar.");
+  const cfg = epi_cfg_();
+
+  const html = HtmlService.createHtmlOutputFromFile("Sidebar")
+    .setTitle(cfg.APP_NAME || "Episode Control Panel");
+  ui.showSidebar(html);
+}
+
+function episode_openControlPanelWide() {
+  epi_securityGuard_();
+
+  const ui = epi_safeUi_();
+  if (!ui) throw new Error("Buka dari Google Sheets untuk membuka dialog.");
+
+  const cfg = epi_cfg_();
+  const w = epi_toNum_(cfg.UI_WIDE_WIDTH, 1200);
+  const h = epi_toNum_(cfg.UI_WIDE_HEIGHT, 820);
+
+  const html = HtmlService.createHtmlOutputFromFile("Sidebar")
+    .setTitle(cfg.APP_NAME || "Episode Control Panel")
+    .setWidth(w)
+    .setHeight(h);
+
+  ui.showModelessDialog(html, (cfg.APP_NAME || "Episode") + " (Wide)");
+}
+
+// ==============================
+// SETUP INIT (OWNER ONLY)
+// ==============================
+function episode_setupInit() {
+  epi_securityGuard_();
+  epi_requireAllowlistedUser_();
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  let sh = ss.getSheetByName(EP_SETUP_SHEET);
+  if (sh) ss.deleteSheet(sh);
+  sh = ss.insertSheet(EP_SETUP_SHEET);
+
+  sh.getRange(1, 1, 1, 2).setValues([["KEY", "VALUE"]]).setFontWeight("bold");
+  sh.getRange(2, 1, EP_DEFAULT_SETTINGS.length, 2).setValues(EP_DEFAULT_SETTINGS);
+
+  sh.setFrozenRows(1);
+  sh.autoResizeColumns(1, 2);
+
+  epi_ensureLogSheet_();
+
+  epi_log_("INFO", "SETUP_INIT", "__SETUP dibuat/reset", { version: EP_VERSION });
+  epi_alertSafe_("Episode Setup", "Setup initialized.\n\nSekarang buka Control Panel untuk edit settings kapan pun.");
+  return "OK";
+}
+
+// ==============================
+// UI API (for Sidebar.html)
+// ==============================
+function epi_ui_getSettings() {
+  epi_securityGuard_();
+  const cfg = epi_cfgRaw_(true);
+  const meta = epi_ui_meta_();
+  return { cfg, meta };
+}
+
+function epi_ui_getComputedSettings() {
+  epi_securityGuard_();
+  const cfg = epi_cfg_();
+  const meta = epi_ui_meta_();
+  return { cfg, meta };
+}
+
+// ==============================
+// UI SAVE SETTINGS (SMART PATCH / MERGE)
+// - Fix: jangan overwrite value lama dengan field kosong dari UI
+// - Support: allow empty only for specific keys (mis. CALENDAR_ID, GANTT_HEADER_ROW, NOTIFY_EMAIL_TO)
+// ==============================
+
+// Key yang memang boleh dikosongkan (clear) lewat UI tanpa dianggap "skip"
+const EP_UI_EMPTY_OK_KEYS = {
+  "CALENDAR_ID": true,        // kosong = default calendar
+  "GANTT_HEADER_ROW": true,   // kosong = auto-scan header
+  "NOTIFY_EMAIL_TO": true     // boleh kosong
+  // tambahkan kalau ada field lain yang memang boleh kosong
+};
+
+function epi_ui_normalizeValue_(v) {
+  if (v === undefined) return { has: false, value: null };
+
+  // null dianggap "ingin kosongkan"
+  if (v === null) return { has: true, value: "" };
+
+  // boolean jadi TRUE/FALSE (biar konsisten dengan validator + sheet)
+  if (typeof v === "boolean") return { has: true, value: v ? "TRUE" : "FALSE" };
+
+  // number biarkan
+  if (typeof v === "number") return { has: true, value: v };
+
+  // string trim
+  if (typeof v === "string") return { has: true, value: v.trim() };
+
+  // lainnya paksa string
+  return { has: true, value: String(v).trim() };
+}
+
+/**
+ * Build patch final yang aman:
+ * - skip key yang value-nya kosong, KECUALI key masuk allow-empty
+ * - skip kalau value sama dengan value existing (hemat write + minim risiko)
+ */
+function epi_ui_sanitizePatch_(patch, existingCfg, opts) {
+  opts = opts || {};
+  const forceEmpty = !!opts.forceEmpty; // kalau true: kosong pun dianggap update (untuk action khusus)
+  const out = {};
+
+  Object.keys(patch || {}).forEach(k => {
+    const key = String(k || "").trim();
+    if (!key) return;
+
+    const norm = epi_ui_normalizeValue_(patch[k]);
+    if (!norm.has) return;
+
+    const allowEmpty = !!EP_UI_EMPTY_OK_KEYS[key];
+    const v = norm.value;
+
+    // kalau UI ngirim kosong, defaultnya kita SKIP supaya tidak overwrite setting lama
+    if (!forceEmpty) {
+      const isEmpty =
+        v === "" ||
+        v === null ||
+        (typeof v === "string" && v.trim() === "");
+
+      if (isEmpty && !allowEmpty) return;
+    }
+
+    // skip kalau sama dengan yang sudah tersimpan
+    try {
+      const cur = (existingCfg && Object.prototype.hasOwnProperty.call(existingCfg, key))
+        ? existingCfg[key]
+        : undefined;
+
+      if (cur !== undefined && String(cur) === String(v)) return;
+    } catch (e) {}
+
+    out[key] = v;
+  });
+
+  return out;
+}
+
+/**
+ * Deduplicate __SETUP: keep last value per KEY.
+ * Dipanggil saat save (bukan saat onOpen) supaya tidak “diam-diam” mengubah file saat load menu.
+ */
+function epi_setupDedupKeys_(setupSheet) {
+  const values = setupSheet.getDataRange().getValues();
+  if (!values || values.length < 2) return;
+
+  const seen = {};
+  const picked = [];
+
+  // scan dari bawah: keep yang terakhir
+  for (let i = values.length - 1; i >= 1; i--) {
+    const k = String(values[i][0] || "").trim();
+    if (!k) continue;
+    if (seen[k]) continue;
+    seen[k] = true;
+    picked.push([k, values[i][1]]);
+  }
+  picked.reverse();
+
+  const out = [values[0]].concat(picked);
+
+  setupSheet.clearContents();
+  setupSheet.getRange(1, 1, out.length, 2).setValues(out);
+  setupSheet.getRange(1, 1, 1, 2).setFontWeight("bold");
+  setupSheet.setFrozenRows(1);
+  setupSheet.autoResizeColumns(1, 2);
+}
+
+function epi_ui_saveSettings(patch, opts) {
+  epi_securityGuard_();
+
+  if (!patch || typeof patch !== "object") throw new Error("Patch invalid.");
+
+  // Lock supaya tidak ada race condition kalau 2 tab/sidebar klik save bareng
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(15000)) throw new Error("Settings sedang disimpan di tempat lain. Coba lagi.");
+
+  try {
+    const sh = epi_getSetupSheet_(true);
+
+    // Ambil cfg existing untuk compare dan untuk “skip empty overwrite”
+    const existingCfg = epi_cfgRaw_(true);
+
+    // sanitize patch: patch-only, bukan replace
+    const safePatch = epi_ui_sanitizePatch_(patch, existingCfg, opts);
+
+    // Kalau tidak ada perubahan efektif, pulang tanpa ngerusak apapun
+    const keys = Object.keys(safePatch);
+    if (!keys.length) {
+      return { ok: true, saved: 0, savedKeys: [], note: "No effective changes (skipped empty/unchanged)." };
+    }
+
+    // Validasi hanya terhadap patch yang benar-benar akan ditulis
+    const issues = epi_validatePatch_(safePatch);
+    if (issues.length) {
+      epi_log_("WARN", "SAVE_BLOCKED", "Save diblokir (validasi gagal)", { issues });
+      return { ok: false, issues };
+    }
+
+    // map key -> row
+    const values = sh.getDataRange().getValues();
+    const rowByKey = {};
+    for (let i = 1; i < values.length; i++) {
+      const key = String(values[i][0] || "").trim();
+      if (key) rowByKey[key] = i + 1; // last occurrence wins
+    }
+
+    // update minimal
+    keys.forEach(k => {
+      const key = String(k || "").trim();
+      if (!key) return;
+      const v = safePatch[k];
+
+      if (rowByKey[key]) sh.getRange(rowByKey[key], 2).setValue(v);
+      else sh.appendRow([key, v]);
+    });
+
+    epi_setupEnsureKeys_(sh, EP_DEFAULT_SETTINGS);
+
+    // rapikan duplikasi key (kalau ada user pernah edit manual)
+    try { epi_setupDedupKeys_(sh); } catch (e) {}
+
+    SpreadsheetApp.flush();
+
+    epi_log_("INFO", "SAVE_OK", "Settings tersimpan via UI (smart patch)", {
+      keys,
+      version: EP_VERSION
+    });
+
+    // Return cfg terbaru supaya UI bisa langsung refresh
+    const fresh = epi_cfgRaw_(true);
+    return { ok: true, saved: keys.length, savedKeys: keys, cfg: fresh };
+
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+function epi_ui_meta() {
+  epi_securityGuard_();
+  return epi_ui_meta_();
+}
+
+function epi_ui_getLastError() {
+  epi_securityGuard_();
+  return epi_getLastError_();
+}
+
+function epi_ui_clearLastError() {
+  epi_securityGuard_();
+  try {
+    PropertiesService.getScriptProperties().deleteProperty(EP_SECURITY.LAST_ERROR_KEY);
+  } catch (e) {}
+  return { ok: true };
+}
+
+function epi_ui_getLogTail(limit) {
+  epi_securityGuard_();
+  const sh = epi_ensureLogSheet_();
+  const lim = Math.min(Math.max(1, epi_toNum_(limit, 200)), 1000);
+
+  const header = sh.getRange(1, 1, 1, 6).getValues()[0];
+  const last = sh.getLastRow();
+  const total = Math.max(0, last - 1);
+  if (last <= 1) return { header, rows: [], total: 0 };
+
+  const start = Math.max(2, last - lim + 1);
+  const rows = sh.getRange(start, 1, last - start + 1, 6).getValues();
+  return { header, rows, total };
+}
+
+function epi_ui_clearLogs() {
+  epi_securityGuard_();
+
+  const sh = epi_ensureLogSheet_();
+  const last = sh.getLastRow();
+  if (last > 1) {
+    try { sh.deleteRows(2, last - 1); } catch (e) {}
+  }
+  epi_log_("INFO", "LOG_CLEAR", "Diagnostics log cleared by UI", { version: EP_VERSION });
+  return { ok: true };
+}
+
+// Wrappers commonly used by HTML
+function epi_ui_status() { epi_securityGuard_(); return episode_statusSummary(); }
+function epi_ui_runDiagnostics() { epi_securityGuard_(); return episode_diagnostics(true); }
+function epi_ui_openWide() { epi_securityGuard_(); episode_openControlPanelWide(); return "Opened wide"; }
+function epi_ui_install() { epi_securityGuard_(); epi_requireAllowlistedUser_(); return episode_install(); }
+function epi_ui_authorizeCalendar() { epi_securityGuard_(); return episode_authorizeCalendarWritePrompt(); }
+function epi_ui_syncAll() { epi_securityGuard_(); return syncTasksToCalendar(); }
+function epi_ui_syncSelectedRow() { epi_securityGuard_(); return episode_syncSelectedRow(); }
+function epi_ui_syncRowByNumber(rowNum) {
+  epi_securityGuard_();
+  const n = parseInt(String(rowNum || "").trim(), 10);
+  if (!n || isNaN(n) || n < 1) throw new Error("Row tidak valid.");
+  PropertiesService.getScriptProperties().setProperty(EP_SECURITY.ONLY_ROW_KEY, String(n));
+  return syncTasksToCalendar();
+}
+function epi_ui_templateMake(opts) { epi_securityGuard_(); epi_requireAllowlistedUser_(); return episode_templateMake_(opts); }
+function epi_ui_setupInit() { epi_securityGuard_(); epi_requireAllowlistedUser_(); return episode_setupInit(); }
+function epi_ui_verifyLicense() { epi_securityGuard_(); return episode_verifyLicense(); }
+function epi_ui_selftest() { epi_securityGuard_(); return episode_selftest(true); }
+
+function epi_validatePatch_(patch) {
+  const issues = [];
+
+  const numKeys = [
+    "UI_WIDE_WIDTH", "UI_WIDE_HEIGHT",
+    "GANTT_FALLBACK_YEAR", "GANTT_ACTIVITY_COL", "GANTT_DATE_COL_START",
+    "GANTT_HEADER_SCAN_MAX_ROWS", "GANTT_EMPTY_RUN_STOP", "GANTT_HEADER_ROW",
+    "MAX_EVENTS_PER_RUN", "MAX_DELETE_PER_RUN",
+    "SYNC_RANGE_DAYS_BEFORE", "SYNC_RANGE_DAYS_AFTER",
+    "NOTIFY_TOAST_SECONDS", "TPL_DEFAULT_DAYS", "TPL_HEADER_ROW",
+    "LOG_MAX_ROWS", "LOG_TRIM_BUFFER",
+    "SELFTEST_MAX_TASK_ROWS_SCAN"
+  ];
+
+  numKeys.forEach(k => {
+    if (k in patch) {
+      const s = String(patch[k] === null || patch[k] === undefined ? "" : patch[k]).trim();
+      if (!s && k === "GANTT_HEADER_ROW") return; // allow empty
+      const n = parseInt(s.replace(/[^0-9-]/g, ""), 10);
+      if (isNaN(n)) issues.push(k + " harus angka.");
+    }
+  });
+
+  const boolKeys = [
+    "GANTT_WEEKEND_BRIDGE",
+    "NOTIFY_TOAST", "NOTIFY_EMAIL_ENABLED", "NOTIFY_EMAIL_ON_ERROR", "NOTIFY_EMAIL_ON_SYNC",
+    "TPL_INCLUDE_SAMPLE_TASKS",
+    "HASH_COMPAT_ACCEPT_V1", "HASH_COMPAT_ACCEPT_V2",
+    "SELFTEST_CALENDAR_WRITE", "SELFTEST_DRYRUN_PLAN_SYNC"
+  ];
+  boolKeys.forEach(k => {
+    if (k in patch) {
+      const s = String(patch[k]).trim().toUpperCase();
+      if (!["TRUE", "FALSE"].includes(s)) issues.push(k + " harus TRUE/FALSE.");
+    }
+  });
+
+  if ("HASH_VERSION" in patch) {
+    const hv = String(patch.HASH_VERSION || "").trim().toUpperCase();
+    if (!["V1", "V2"].includes(hv)) issues.push("HASH_VERSION harus V1 atau V2.");
+  }
+
+  if ("COLOR_RULES_JSON" in patch) {
+    try { JSON.parse(String(patch.COLOR_RULES_JSON || "")); } catch (e) { issues.push("COLOR_RULES_JSON harus JSON valid."); }
+  }
+  if ("REMINDER_RULES_JSON" in patch) {
+    try { JSON.parse(String(patch.REMINDER_RULES_JSON || "")); } catch (e) { issues.push("REMINDER_RULES_JSON harus JSON valid."); }
+  }
+
+  return issues;
+}
+
+function epi_ui_meta_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+  const lockInfo = epi_getLockInfo_();
+  const ownerChk = epi_getOwnerAllowCheck_();
+
+  return {
+    version: EP_VERSION,
+    setupSheet: EP_SETUP_SHEET,
+    logSheet: EP_LOG_SHEET,
+    fileName: ss.getName(),
+    fileUrl: ss.getUrl(),
+    lastError: epi_getLastError_(),
+    lastSyncTime: String(props.getProperty(EP_SECURITY.LAST_SYNC_TIME_KEY) || ""),
+    lastSyncSummary: String(props.getProperty(EP_SECURITY.LAST_SYNC_SUMMARY_KEY) || ""),
+    lock: lockInfo,
+    ownerCheck: ownerChk
+  };
+}
+
+// ==============================
+// NOTIFICATIONS + LOGGING
+// ==============================
+function epi_log_(level, code, message, context, stack) {
+  try {
+    const cfg = epi_cfg_(false); // jangan memaksa create setup sheet saat log
+    const sh = epi_ensureLogSheet_();
+    const ts = Utilities.formatDate(new Date(), cfg.TIMEZONE || "Asia/Jakarta", "yyyy-MM-dd HH:mm:ss");
+
+    let ctx = "";
+    try { ctx = JSON.stringify(context || {}); } catch (e) { ctx = "{}"; }
+    // jaga ukuran cell
+    if (ctx.length > 45000) ctx = ctx.slice(0, 45000) + "...(truncated)";
+
+    sh.appendRow([
+      ts,
+      level || "INFO",
+      code || "",
+      message || "",
+      ctx,
+      stack || ""
+    ]);
+
+    // Optional log trimming
+    const maxRows = epi_toNum_(cfg.LOG_MAX_ROWS, 8000);
+    const buffer = epi_toNum_(cfg.LOG_TRIM_BUFFER, 500);
+    const last = sh.getLastRow();
+    if (maxRows > 0 && last > (maxRows + buffer + 1)) {
+      const extra = last - (maxRows + 1);
+      if (extra > 0) sh.deleteRows(2, extra);
+    }
+  } catch (e) {}
+}
+
+function epi_notify_(cfg, title, message, opts) {
+  opts = opts || {};
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (cfg.NOTIFY_TOAST) {
+    try { ss.toast(String(message || ""), String(title || ""), cfg.NOTIFY_TOAST_SECONDS || 4); } catch (e) {}
+  }
+
+  const doEmail = cfg.NOTIFY_EMAIL_ENABLED && cfg.NOTIFY_EMAIL_TO &&
+    ((opts.kind === "ERROR" && cfg.NOTIFY_EMAIL_ON_ERROR) || (opts.kind === "SYNC" && cfg.NOTIFY_EMAIL_ON_SYNC));
+
+  if (doEmail) {
+    try {
+      MailApp.sendEmail({
+        to: String(cfg.NOTIFY_EMAIL_TO).trim(),
+        subject: `[${cfg.APP_NAME || "Episode"}] ${String(title || "Notification")}`,
+        body: String(message || "")
+      });
+    } catch (e) {}
+  }
+}
+
+// ==============================
+// CALENDAR ACCESS
+// ==============================
+function epi_getCalendar_(cfg) {
+  try {
+    const id = String(cfg.CALENDAR_ID || "").trim();
+    const cal = id ? CalendarApp.getCalendarById(id) : CalendarApp.getDefaultCalendar();
+    return cal || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ==============================
+// INSTALL TRIGGER (OWNER ONLY)
+// ==============================
+function episode_install() {
+  epi_securityGuard_();
+  epi_requireAllowlistedUser_();
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction && t.getHandlerFunction() === EP_SECURITY.INSTALL_TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger(EP_SECURITY.INSTALL_TRIGGER_HANDLER)
+    .forSpreadsheet(ss)
+    .onOpen()
+    .create();
+
+  epi_log_("INFO", "INSTALL_OK", "Installed onOpen trigger", { version: EP_VERSION });
+  epi_alertSafe_("Episode Install",
+    "Installed.\n\n" +
+    "Tutup spreadsheet lalu buka lagi.\n" +
+    "Trigger onOpen installed membantu license-check lebih stabil."
+  );
+
+  return "Installed";
+}
+
+function episode_onOpenInstalled(e) {
+  // installed trigger should enforce security; if untrusted -> lockdown + wipe
+  try {
+    epi_securityGuard_();
+  } catch (err) {
+    return;
+  }
+  episode_buildMenu_();
+}
+
+// ==============================
+// LOCKDOWN (anti-copy)
+// ==============================
+function activateLockdown_(reason) {
+  const cfg = epi_cfg_(false); // jangan create sheet config saat lockdown
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = epi_safeUi_();
+  const sheets = ss.getSheets();
+
+  const who = epi_getCallerEmail_();
+  const picked = who.effective || who.active || "(unknown)";
+  const chk = epi_getOwnerAllowCheck_();
+  const fileOwner = chk.containerOwnerEmail || "(unknown/unreadable)";
+  const scriptOwner = chk.scriptOwnerEmail || "(unknown/unreadable)";
+
+  try {
+    MailApp.sendEmail({
+      to: EP_SECURITY.ALLOWED_OWNERS.join(","),
+      subject: `${cfg.APP_NAME || "Episode"} ALERT: Unauthorized Copy Detected`,
+      body:
+        `${cfg.COMPANY_LINE || ""}\n\n` +
+        "Terdeteksi akses/salinan tidak sah pada dashboard.\n\n" +
+        "DETAIL:\n" +
+        `- Reason: ${reason || "(not provided)"}\n` +
+        `- Effective user: ${who.effective || "(unknown)"}\n` +
+        `- Active user: ${who.active || "(unknown)"}\n` +
+        `- Email pembuka (picked): ${picked}\n` +
+        `- Owner file (Drive): ${fileOwner}\n` +
+        `- Owner script (Drive): ${scriptOwner}\n` +
+        `- Nama File: ${ss.getName()}\n` +
+        `- Link File: ${ss.getUrl()}\n` +
+        `- Version: ${EP_VERSION}\n\n` +
+        "Sistem otomatis mengunci file tersebut."
+    });
+  } catch (e) {}
+
+  if (ui) {
+    ui.alert(
+      `${cfg.APP_NAME || "Episode"}: AKSES DITOLAK`,
+      "File ini adalah Properti Intelektual Episode (Wedding Planner).\n\n" +
+      "Anda tidak memiliki lisensi ownership untuk menggunakan salinan file ini.\n\n" +
+      "Silakan hubungi owner resmi.",
+      ui.ButtonSet.OK
+    );
+  }
+
+  let lockSheet = ss.getSheetByName(cfg.LOCK_SHEET || "LOCK_SCREEN");
+  if (!lockSheet) lockSheet = ss.insertSheet(cfg.LOCK_SHEET || "LOCK_SCREEN");
+  else { try { lockSheet.clear(); } catch (e) {} }
+
+  lockSheet.getRange("A1").setValue(`LOCKDOWN - ${cfg.APP_NAME || "Episode"}`);
+  lockSheet.getRange("A2").setValue("Lisensi tidak ditemukan / akses tidak sah terdeteksi.");
+  lockSheet.getRange("A3").setValue("Alasan: " + (reason || "-"));
+  lockSheet.getRange("A4").setValue("Hubungi owner resmi:");
+  lockSheet.getRange("A5").setValue(EP_SECURITY.ALLOWED_OWNERS.join(" | "));
+
+  lockSheet.getRange("A1:Z120").setBackground("#0b0b0f");
+  lockSheet.getRange("A1").setFontColor("#ff2d2d").setFontSize(22).setFontWeight("bold");
+  lockSheet.getRange("A2:A5").setFontColor("#ffffff").setFontSize(12);
+  try { lockSheet.setColumnWidths(1, 1, 900); } catch (e) {}
+  try { lockSheet.setRowHeights(1, 5, 26); } catch (e) {}
+
+  sheets.forEach(sh => {
+    if (sh.getName() !== (cfg.LOCK_SHEET || "LOCK_SCREEN")) {
+      try { sh.hideSheet(); } catch (e) {}
+    }
+  });
+
+  ss.setActiveSheet(lockSheet);
+}
+
+// ==============================
+// CALENDAR AUTH TEST (EDITOR OK)
+// ==============================
+function episode_authorizeCalendarWritePrompt() {
+  epi_securityGuard_();
+
+  const cfg = epi_cfg_();
+  const cal = epi_getCalendar_(cfg);
+  if (!cal) throw new Error("Calendar ID tidak valid / tidak bisa diakses.");
+
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  d.setHours(9, 0, 0, 0);
+  const end = new Date(d.getTime());
+  end.setHours(10, 0, 0, 0);
+
+  try {
+    const ev = cal.createEvent("Episode Auth Test (auto-delete)", d, end, {
+      description: "Authorization test. This event will be deleted automatically."
+    });
+    ev.deleteEvent();
+
+    epi_alertSafe_("Authorize", "Authorization OK (Calendar write test passed).\n\nCalendar: " + cal.getName());
+    epi_log_("INFO", "AUTH_OK", "Calendar write test passed", { calendar: cal.getName(), version: EP_VERSION });
+    return "Authorized";
+  } catch (e) {
+    const msg = (e && e.message) ? e.message : String(e);
+    epi_setLastError_("Authorize Calendar failed:\n" + msg);
+    epi_log_("ERROR", "AUTH_FAIL", "Calendar write test failed", { error: msg }, e && e.stack ? e.stack : "");
+    throw new Error(
+      "Authorization failed.\n\n" +
+      "Jalankan dari menu/sidebar (interactive) dulu supaya OAuth prompt muncul.\n\n" +
+      msg
+    );
+  }
+}
+
+// ==============================
+// TEMPLATE MAKER (OWNER ONLY)
+// ==============================
+function episode_templateMakerPrompt() {
+  epi_securityGuard_();
+  epi_requireAllowlistedUser_();
+
+  const cfg = epi_cfg_();
+  const ui = epi_safeUi_();
+  if (!ui) throw new Error("Buka dari Google Sheets.");
+
+  const res = ui.prompt(
+    "Template Maker - Master Schedule",
+    "Ini akan membangun ulang layout Gantt di sheet Master Schedule.\n\n" +
+    "Masukkan jumlah hari (contoh 180). Kosong = pakai default.\n\n" +
+    "Catatan: Konten sheet akan di-reset.",
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (res.getSelectedButton() !== ui.Button.OK) return "Canceled";
+
+  const rawDays = String(res.getResponseText() || "").trim();
+  const days = rawDays ? parseInt(rawDays, 10) : cfg.TPL_DEFAULT_DAYS;
+  if (!days || isNaN(days) || days < 7 || days > 1000) throw new Error("Jumlah hari tidak valid (min 7, max 1000).");
+
+  const out = episode_templateMake_({ days, includeSamples: cfg.TPL_INCLUDE_SAMPLE_TASKS });
+  epi_alertSafe_("Template Maker", out);
+  return out;
+}
+
+function episode_templateMake_(opts) {
+  epi_securityGuard_();
+  epi_requireAllowlistedUser_();
+
+  const cfg = epi_cfg_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const days = (opts && opts.days !== undefined && opts.days !== null && String(opts.days).trim() !== "")
+    ? parseInt(opts.days, 10)
+    : cfg.TPL_DEFAULT_DAYS;
+
+  let includeSamples = cfg.TPL_INCLUDE_SAMPLE_TASKS;
+  if (opts && Object.prototype.hasOwnProperty.call(opts, "includeSamples")) {
+    const v = opts.includeSamples;
+    if (typeof v === "boolean") includeSamples = v;
+    else includeSamples = (String(v).trim().toUpperCase() === "TRUE");
+  }
+
+  let sh = ss.getSheetByName(cfg.TIMELINE_SHEET_NAME);
+  if (!sh) sh = ss.insertSheet(cfg.TIMELINE_SHEET_NAME);
+  sh.clear();
+
+  const headerRow = epi_toNum_(cfg.TPL_HEADER_ROW, 10);
+  const activityCol = cfg.GANTT_ACTIVITY_COL;
+  const dateColStart = cfg.GANTT_DATE_COL_START;
+
+  sh.getRange(1, 1).setValue(cfg.COMPANY_LINE || "Episode - Wedding Planner").setFontWeight("bold").setFontSize(14);
+  sh.getRange(2, 1).setValue("Master Schedule (Gantt) - marker 1 huruf per tanggal.").setFontColor("#444");
+  sh.getRange(3, 1).setValue("Calendar ID (optional mirror):").setFontColor("#444");
+  sh.getRange(3, 2).setValue(cfg.CALENDAR_ID || "").setFontColor("#111");
+  sh.getRange(4, 1).setValue("Episode Version:").setFontColor("#444");
+  sh.getRange(4, 2).setValue(EP_VERSION).setFontColor("#111");
+
+  sh.getRange(headerRow, activityCol).setValue(cfg.GANTT_HEADER_KEY).setFontWeight("bold").setBackground("#111").setFontColor("#fff");
+
+  const startDate = epi_startOfDay_(new Date());
+  const headerDates = [];
+  for (let i = 0; i < days; i++) headerDates.push(epi_addDays_(startDate, i));
+
+  const headerRange = sh.getRange(headerRow, dateColStart, 1, days);
+  headerRange.setValues([headerDates]);
+  headerRange.setNumberFormat("d-MMM");
+  headerRange.setFontWeight("bold");
+  headerRange.setBackground("#111");
+  headerRange.setFontColor("#fff");
+
+  sh.setFrozenRows(headerRow);
+  sh.setFrozenColumns(1);
+  sh.setColumnWidth(1, 320);
+  for (let c = dateColStart; c < dateColStart + Math.min(days, 40); c++) sh.setColumnWidth(c, 40);
+
+  if (includeSamples) {
+    const baseRow = headerRow + 1;
+    const tasks = [
+      "Venue visit [10:00 - 12:00]",
+      "DP Vendor Dekorasi",
+      "Meeting WO",
+      "Akad (Hari H)",
+      "Resepsi (Hari H)"
+    ];
+    sh.getRange(baseRow, 1, tasks.length, 1).setValues(tasks.map(t => [t]));
+    sh.getRange(baseRow, 1, tasks.length, 1).setFontWeight("bold");
+
+    sh.getRange(baseRow, dateColStart + 2).setValue("A");
+    sh.getRange(baseRow + 1, dateColStart + 10).setValue("B");
+    sh.getRange(baseRow + 2, dateColStart + 7).setValue("C");
+    sh.getRange(baseRow + 3, dateColStart + 50).setValue("H");
+    sh.getRange(baseRow + 4, dateColStart + 50).setValue("H");
+  }
+
+  try {
+    if (cfg.CALENDAR_ID_CELL_A1) sh.getRange(cfg.CALENDAR_ID_CELL_A1).setValue(cfg.CALENDAR_ID || "");
+  } catch (e) {}
+
+  const msg =
+    "Template Master Schedule dibuat.\n\n" +
+    `Sheet: ${cfg.TIMELINE_SHEET_NAME}\n` +
+    `Header row: ${headerRow}\n` +
+    `Days: ${days}\n` +
+    `Samples: ${includeSamples ? "YES" : "NO"}`;
+
+  epi_log_("INFO", "TPL_OK", "Template maker run", { sheet: cfg.TIMELINE_SHEET_NAME, days, samples: includeSamples, headerRow, version: EP_VERSION });
+  return msg;
+}
+
+// ==============================
+// SYNC HELPERS
+// ==============================
+function epi_getTimelineSheet_(ss, cfg) {
+  return ss.getSheetByName(cfg.TIMELINE_SHEET_NAME);
+}
+
+function epi_startOfDay_(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
+function epi_addDays_(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+function epi_isWeekend_(d) { const day = d.getDay(); return (day === 0 || day === 6); }
+function epi_daysDiff_(a, b) {
+  const A = epi_startOfDay_(a).getTime();
+  const B = epi_startOfDay_(b).getTime();
+  return Math.round((B - A) / (24 * 3600 * 1000));
+}
+
+// month parser: tambah variasi Indo
+function epi_monthIndex_(m) {
+  const key = epi_norm_(m).replace(/\./g, "").slice(0, 3);
+  const map = {
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, mei: 4,
+    jun: 5, jul: 6, aug: 7, agu: 7, ags: 7,
+    sep: 8, oct: 9, okt: 9,
+    nov: 10, dec: 11, des: 11
+  };
+  return (key in map) ? map[key] : null;
+}
+
+function epi_parseHeaderDate_(val, fallbackYear, prevDate) {
+  if (val instanceof Date) return epi_startOfDay_(val);
+
+  // Excel serial (basic)
+  if (typeof val === "number" && val > 10000 && val < 80000) {
+    const ms = (val - 25569) * 86400 * 1000;
+    return epi_startOfDay_(new Date(ms));
+  }
+
+  const s = String(val || "").trim();
+  if (!s) return null;
+
+  const m = s.match(/^(\d{1,2})\s*[-/\s]\s*([A-Za-z]{3,})\s*(?:[-/\s]\s*(\d{2,4}))?$/);
+  if (!m) return null;
+
+  const day = parseInt(m[1], 10);
+  const monIdx = epi_monthIndex_(m[2]);
+  if (monIdx === null) return null;
+
+  let year = fallbackYear;
+  if (m[3]) {
+    let y = parseInt(m[3], 10);
+    if (y < 100) y = 2000 + y;
+    year = y;
+  } else if (prevDate instanceof Date) {
+    const prevMon = prevDate.getMonth();
+    if (prevMon === 11 && monIdx === 0) year = prevDate.getFullYear() + 1;
+    else year = prevDate.getFullYear();
+  }
+
+  return epi_startOfDay_(new Date(year, monIdx, day));
+}
+
+function epi_findGanttLayout_(sheet, cfg) {
+  const lastRow = sheet.getLastRow();
+
+  // If header row fixed in config, use it first
+  let headerRow = -1;
+  if (cfg.GANTT_HEADER_ROW_NUM && cfg.GANTT_HEADER_ROW_NUM > 0) {
+    const r = cfg.GANTT_HEADER_ROW_NUM;
+    const v = epi_norm_(sheet.getRange(r, cfg.GANTT_ACTIVITY_COL).getDisplayValue());
+    if (v && (v === cfg.GANTT_HEADER_KEY || v.indexOf(cfg.GANTT_HEADER_KEY) >= 0)) headerRow = r;
+    else throw new Error(`GANTT_HEADER_ROW=${r} tidak valid (header key tidak cocok).`);
+  } else {
+    const scanRows = Math.min(lastRow, cfg.GANTT_HEADER_SCAN_MAX_ROWS);
+    const colA = sheet.getRange(1, cfg.GANTT_ACTIVITY_COL, scanRows, 1).getDisplayValues();
+    for (let r = 0; r < colA.length; r++) {
+      const v = epi_norm_(colA[r][0]);
+      if (!v) continue;
+      if (v === cfg.GANTT_HEADER_KEY || v.indexOf(cfg.GANTT_HEADER_KEY) >= 0) {
+        headerRow = r + 1;
+        break;
+      }
+    }
+  }
+
+  if (headerRow < 0) throw new Error(`Tidak menemukan header "${String(cfg.GANTT_HEADER_KEY).toUpperCase()}" di kolom A.`);
+
+  const lastCol = sheet.getLastColumn();
+  const width = Math.max(1, lastCol - (cfg.GANTT_DATE_COL_START - 1));
+  const headerVals = sheet.getRange(headerRow, cfg.GANTT_DATE_COL_START, 1, width).getValues()[0];
+
+  const fallbackYear = cfg.GANTT_FALLBACK_YEAR;
+  const dates = [];
+  const dateCols = [];
+  let prev = null;
+  let emptyRun = 0;
+
+  for (let i = 0; i < headerVals.length; i++) {
+    const col = cfg.GANTT_DATE_COL_START + i;
+    const d = epi_parseHeaderDate_(headerVals[i], fallbackYear, prev);
+
+    if (!d) {
+      if (dates.length > 0) {
+        emptyRun++;
+        if (emptyRun >= cfg.GANTT_EMPTY_RUN_STOP) break;
+      }
+      continue;
+    }
+
+    emptyRun = 0;
+    dates.push(d);
+    dateCols.push(col);
+    prev = d;
+  }
+
+  if (!dates.length) throw new Error("Header ditemukan tapi tidak ada tanggal valid di baris header.");
+
+  // cari lastTaskRow dari kolom activity
+  const colAAll = sheet.getRange(headerRow + 1, cfg.GANTT_ACTIVITY_COL, Math.max(1, lastRow - headerRow), 1).getDisplayValues();
+  let lastTaskRow = headerRow;
+  for (let i = colAAll.length - 1; i >= 0; i--) {
+    if (String(colAAll[i][0] || "").trim()) { lastTaskRow = headerRow + 1 + i; break; }
+  }
+  if (lastTaskRow <= headerRow) lastTaskRow = lastRow;
+
+  return {
+    headerRow,
+    firstTaskRow: headerRow + 1,
+    lastTaskRow,
+    dateCols,
+    dates,
+    minDate: dates[0],
+    maxDate: dates[dates.length - 1]
+  };
+}
+
+function epi_shouldBridgeWeekendGap_(prevDate, curDate, cfg) {
+  if (!cfg.GANTT_WEEKEND_BRIDGE) return epi_daysDiff_(prevDate, curDate) === 1;
+
+  const diff = epi_daysDiff_(prevDate, curDate);
+  if (diff === 1) return true;
+  if (diff < 1 || diff > 3) return false;
+
+  let d = epi_addDays_(prevDate, 1);
+  while (d.getTime() < curDate.getTime()) {
+    if (!epi_isWeekend_(d)) return false;
+    d = epi_addDays_(d, 1);
+  }
+  return true;
+}
+
+function epi_groupDatesIntoSegments_(dates, cfg) {
+  if (!dates || !dates.length) return [];
+  dates.sort((a, b) => a.getTime() - b.getTime());
+
+  const segs = [];
+  let start = dates[0];
+  let prev = dates[0];
+
+  for (let i = 1; i < dates.length; i++) {
+    const cur = dates[i];
+    if (epi_shouldBridgeWeekendGap_(prev, cur, cfg)) {
+      prev = cur;
+      continue;
+    }
+    segs.push({ start, end: prev });
+    start = cur;
+    prev = cur;
+  }
+  segs.push({ start, end: prev });
+  return segs;
+}
+
+function epi_md5WebSafe_(s) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, s, Utilities.Charset.UTF_8);
+  return Utilities.base64EncodeWebSafe(bytes).replace(/=+$/g, "");
+}
+
+function epi_taskParse_(raw) {
+  const text = String(raw || "").trim();
+  const del = /(?:\s|^)-DEL(?:\s|$)/i.test(text);
+  const clean = text
+    .replace(/(?:\s|^)-DEL(?:\s|$)/ig, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return { raw: text, name: clean, del };
+}
+function epi_normalizeUrlMaybe_(u) {
+  let s = String(u || "").trim();
+  if (!s) return "";
+  if (!/^https?:\/\//i.test(s) && /^[\w.-]+\.[a-z]{2,}(\/.*)?$/i.test(s)) {
+    s = "https://" + s;
+  }
+  return s;
+}
+
+function epi_isGoogleMapsUrl_(u) {
+  const s = epi_norm_(u);
+  return !!(
+    s.indexOf("maps.google.") >= 0 ||
+    s.indexOf("goo.gl/maps") >= 0 ||
+    s.indexOf("g.page") >= 0
+  );
+}
+
+function epi_isGoogleMeetUrl_(u) {
+  const s = epi_norm_(u);
+  return !!(
+    s.indexOf("meet.google.com/") >= 0
+  );
+}
+
+function epi_escapeRegExp_(s) {
+  return String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function epi_cleanupNotesText_(txt) {
+  return String(txt || "")
+    .replace(/\r/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Parse kolom C (notes):
+ * - teks bebas
+ * - URL Google Meet -> disimpan sebagai meetUrl (tetap masuk description)
+ * - URL Google Maps -> disimpan sebagai mapUrl (dipakai untuk event location)
+ * - URL lain -> tetap masuk ke notes/description
+ */
+function epi_parseNotesCell_(raw) {
+  const original = String(raw || "").trim();
+  if (!original) {
+    return {
+      raw: "",
+      notes: "",
+      mapUrl: "",
+      meetUrl: "",
+      urls: []
+    };
+  }
+
+  const text = original.replace(/\r/g, "\n");
+  const urlRegex = /((?:https?:\/\/)?(?:[\w-]+\.)+[a-z]{2,}(?:\/[^\s]*)?)/ig;
+  const found = [];
+  let m;
+
+  while ((m = urlRegex.exec(text)) !== null) {
+    const normalized = epi_normalizeUrlMaybe_(m[1]);
+    if (!normalized) continue;
+    if (!found.includes(normalized)) found.push(normalized);
+  }
+
+  let mapUrl = "";
+  let meetUrl = "";
+
+  found.forEach(u => {
+    if (!mapUrl && epi_isGoogleMapsUrl_(u)) mapUrl = u;
+    if (!meetUrl && epi_isGoogleMeetUrl_(u)) meetUrl = u;
+  });
+
+  let notesText = text;
+
+  // Hapus URL yang sudah diparsing dari notes agar tidak dobel berantakan
+  found.forEach(u => {
+    const rawNoProto = u.replace(/^https?:\/\//i, "");
+    notesText = notesText.replace(new RegExp(epi_escapeRegExp_(u), "ig"), " ");
+    notesText = notesText.replace(new RegExp(epi_escapeRegExp_(rawNoProto), "ig"), " ");
+  });
+
+  notesText = epi_cleanupNotesText_(notesText);
+
+  return {
+    raw: original,
+    notes: notesText,
+    mapUrl: mapUrl,
+    meetUrl: meetUrl,
+    urls: found
+  };
+}
+
+function epi_timeBracket_(taskName, cfg) {
+  const m = String(taskName || "").match(cfg.TIMED_BRACKET_REGEX_RE);
+  if (!m) return null;
+  return {
+    sh: parseInt(m[1], 10), sm: parseInt(m[2], 10),
+    eh: parseInt(m[3], 10), em: parseInt(m[4], 10)
+  };
+}
+
+function epi_buildMetaDesc_(cfg, ss, sheet, row, taskName, hashObj, notePack) {
+  const url = ss.getUrl();
+  const np = notePack || {};
+
+  const lines = [];
+
+  // Judul manusiawi (opsional)
+  // lines.push(cfg.COMPANY_LINE || "");
+  // lines.push("");
+
+  // Catatan user (kolom C)
+  if (np.notes) {
+    lines.push("📝 Catatan:");
+    lines.push(np.notes);
+    lines.push("");
+  }
+
+  // Meet
+  if (np.meetUrl) {
+    lines.push("🎥 Google Meet:");
+    lines.push(np.meetUrl);
+    lines.push("");
+  }
+
+  // Link lain
+  const extraUrls = (np.urls || []).filter(u => u && u !== np.meetUrl && u !== np.mapUrl);
+  if (extraUrls.length) {
+    lines.push("🔗 Link:");
+    extraUrls.forEach(u => lines.push(u));
+    lines.push("");
+  }
+
+  // Maps
+  if (np.mapUrl) {
+    lines.push("📍 Lokasi (Google Maps):");
+    lines.push(np.mapUrl);
+    lines.push("");
+  }
+
+  // Dashboard link (opsional, bisa kamu buang kalau mau super clean)
+  lines.push("🔗 Link Dashboard:");
+  lines.push(url);
+
+  return lines.join("\n");
+}
+
+function epi_buildMetaObj_(ss, sheet, row, taskName, hashObj, notePack) {
+  const np = notePack || {};
+  return {
+    v: String(EP_VERSION || ""),
+    fileId: String(ss.getId() || ""),
+    sheet: String(sheet.getName() || ""),
+    row: String(row || ""),
+    task: String(taskName || ""),
+    hash: hashObj && hashObj.active ? String(hashObj.active) : "",
+    hashV1: hashObj && hashObj.v1 ? String(hashObj.v1) : "",
+    hashV2: hashObj && hashObj.v2 ? String(hashObj.v2) : "",
+    meet: np.meetUrl ? String(np.meetUrl) : "",
+    map: np.mapUrl ? String(np.mapUrl) : ""
+  };
+}
+
+function epi_getCalendarIdForApi_(cfg) {
+  const id = String(cfg.CALENDAR_ID || "").trim();
+  if (id) return id;
+  const cal = CalendarApp.getDefaultCalendar();
+  return cal ? cal.getId() : "primary";
+}
+
+
+// Wajib ada helper ini, karena kamu memanggilnya:
+function epi_eventApiIdFromCalEvent_(cfg, ev) {
+  try {
+    const raw = String(ev && ev.getId ? ev.getId() : "").trim();
+    if (!raw) return "";
+    // CalendarApp biasanya ngasih "...@google.com", API butuh bagian sebelum "@"
+    return raw.split("@")[0];
+  } catch (e) {
+    return "";
+  }
+}
+
+function epi_setPrivateMeta_(cfg, ev, metaObj) {
+  try {
+    const calendarId = epi_getCalendarIdForApi_(cfg);
+    const eventId = epi_eventApiIdFromCalEvent_(cfg, ev);
+    if (!eventId) return;
+
+    Calendar.Events.patch(
+      {
+        extendedProperties: {
+          private: {
+            EP_SYNC: "1",
+            EP_VERSION: String(metaObj.v || ""),
+            EP_FILE_ID: String(metaObj.fileId || ""),
+            EP_SHEET: String(metaObj.sheet || ""),
+            EP_ROW: String(metaObj.row || ""),
+            EP_TASK: String(metaObj.task || ""),
+            EP_HASH: String(metaObj.hash || ""),
+            EP_HASH_V1: String(metaObj.hashV1 || ""),
+            EP_HASH_V2: String(metaObj.hashV2 || ""),
+            EP_MEET: String(metaObj.meet || ""),
+            EP_MAP: String(metaObj.map || "")
+          }
+        }
+      },
+      calendarId,
+      eventId
+    );
+  } catch (e) {}
+}
+
+
+function epi_getPrivateMeta_(cfg, ev) {
+  try {
+    const calendarId = epi_getCalendarIdForApi_(cfg);
+    const eventId = epi_eventApiIdFromCalEvent_(cfg, ev);
+    if (!eventId) return null;
+
+    const res = Calendar.Events.get(calendarId, eventId);
+    const p = (res && res.extendedProperties && res.extendedProperties.private)
+      ? res.extendedProperties.private
+      : {};
+
+    // valid Episode event minimal punya fileId + hash
+    if (!p.EP_FILE_ID || !p.EP_HASH) return null;
+
+    return {
+      fileId: String(p.EP_FILE_ID || ""),
+      sheet: String(p.EP_SHEET || ""),
+      row: p.EP_ROW ? parseInt(p.EP_ROW, 10) : null,
+      task: String(p.EP_TASK || ""),
+      hash: String(p.EP_HASH || ""),
+      hashV1: String(p.EP_HASH_V1 || ""),
+      hashV2: String(p.EP_HASH_V2 || ""),
+      meet: String(p.EP_MEET || ""),
+      map: String(p.EP_MAP || "")
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Legacy hash (V1) = UTC ISO based
+function epi_eventHashV1_(taskName, startDate, endDate, isAllDay) {
+  const s = String(taskName || "").trim();
+  let key;
+  if (isAllDay) {
+    const a = epi_startOfDay_(startDate);
+    const b = epi_startOfDay_(endDate); // end exclusive
+    key = [s, "S:" + a.toISOString(), "E:" + b.toISOString(), "T:ALLDAY"].join("|");
+  } else {
+    const a = new Date(startDate);
+    const b = new Date(endDate);
+    key = [s, "S:" + a.toISOString(), "E:" + b.toISOString(), "T:TIMED"].join("|");
+  }
+  return epi_md5WebSafe_(key);
+}
+
+// New hash (V2) = timezone-stable
+function epi_eventHashV2_(cfg, taskName, startDate, endDate, isAllDay) {
+  const s = String(taskName || "").trim();
+  const tz = cfg && cfg.TIMEZONE ? cfg.TIMEZONE : "Asia/Jakarta";
+
+  let key;
+  if (isAllDay) {
+    const a = epi_startOfDay_(startDate);
+    const b = epi_startOfDay_(endDate);
+    const A = Utilities.formatDate(a, tz, "yyyy-MM-dd");
+    const B = Utilities.formatDate(b, tz, "yyyy-MM-dd");
+    key = [s, "S:" + A, "E:" + B, "T:ALLDAY"].join("|");
+  } else {
+    const a = new Date(startDate);
+    const b = new Date(endDate);
+    const A = Utilities.formatDate(a, tz, "yyyy-MM-dd'T'HH:mm:ss");
+    const B = Utilities.formatDate(b, tz, "yyyy-MM-dd'T'HH:mm:ss");
+    key = [s, "S:" + A, "E:" + B, "T:TIMED"].join("|");
+  }
+
+  return epi_md5WebSafe_(key);
+}
+
+function epi_hashPack_(cfg, taskName, startDate, endDate, isAllDay) {
+  const v1 = epi_eventHashV1_(taskName, startDate, endDate, isAllDay);
+  const v2 = epi_eventHashV2_(cfg, taskName, startDate, endDate, isAllDay);
+  const active = (cfg.HASH_VERSION === "V2") ? v2 : v1;
+  return { active, v1, v2 };
+}
+
+function epi_titleClean_(cfg, title) {
+  const t = String(title || "").trim();
+  const prefix = String(cfg.EVENT_PREFIX || "").trim();
+  if (prefix && t.startsWith(prefix)) return t.slice(prefix.length).trim();
+  return t;
+}
+
+function epi_eventColorFromString_(s) {
+  const key = String(s || "").trim().toUpperCase();
+  const m = CalendarApp.EventColor;
+  return m[key] || m.BLUE;
+}
+
+function epi_applyColor_(cfg, event, taskName) {
+  const tl = String(taskName || "").toLowerCase();
+  const rules = cfg.COLOR_RULES || [];
+
+  let fallback = "BLUE";
+  let picked = "";
+  let matched = false;
+
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i] || {};
+    const match = Array.isArray(rule.match) ? rule.match : [];
+    const color = rule.color ? String(rule.color) : "BLUE";
+
+    if (!match.length) {
+      fallback = color;
+      continue;
+    }
+
+    for (let k = 0; k < match.length; k++) {
+      const w = String(match[k] || "").toLowerCase();
+      if (w && tl.indexOf(w) >= 0) {
+        picked = color;
+        matched = true;
+        break;
+      }
+    }
+    if (matched) break;
+  }
+
+  if (!matched) picked = fallback;
+  try { event.setColor(epi_eventColorFromString_(picked)); } catch (e) {}
+}
+
+function epi_applyReminders_(cfg, event, taskName) {
+  const tl = String(taskName || "").toLowerCase();
+  const rules = cfg.REMINDER_RULES || [];
+
+  let fallback = [10080, 4320, 1440];
+  let minutes = null;
+  let matched = false;
+
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i] || {};
+    const match = Array.isArray(rule.match) ? rule.match : [];
+    const mins = Array.isArray(rule.minutes) ? rule.minutes : null;
+
+    if (!match.length) {
+      if (mins) fallback = mins;
+      continue;
+    }
+
+    for (let k = 0; k < match.length; k++) {
+      const w = String(match[k] || "").toLowerCase();
+      if (w && tl.indexOf(w) >= 0) {
+        if (mins) minutes = mins;
+        matched = true;
+        break;
+      }
+    }
+    if (matched) break;
+  }
+
+  if (!minutes) minutes = fallback;
+
+  try {
+    event.removeAllReminders();
+    for (let i = 0; i < minutes.length; i++) {
+      const n = parseInt(minutes[i], 10);
+      if (!n || isNaN(n) || n < 1) continue;
+      event.addPopupReminder(n);
+    }
+  } catch (e) {}
+}
+
+// ==============================
+// EVENT WINDOW + RECONCILE
+// ==============================
+function epi_getEventWindow_(ev) {
+  const isAllDay = (typeof ev.isAllDayEvent === "function") ? ev.isAllDayEvent() : false;
+
+  if (isAllDay) {
+    let st, en;
+    try { st = ev.getAllDayStartDate(); } catch (e) { st = ev.getStartTime(); }
+    try { en = ev.getAllDayEndDate(); } catch (e) { en = ev.getEndTime(); }
+    return { isAllDay: true, start: epi_startOfDay_(st), end: epi_startOfDay_(en) };
+  }
+  return { isAllDay: false, start: ev.getStartTime(), end: ev.getEndTime() };
+}
+
+function epi_reconcileEventToDesired_(cfg, ev, d, ss, sheet) {
+  try {
+    if (String(ev.getTitle() || "") !== String(d.title || "")) ev.setTitle(d.title);
+  } catch (e) {}
+
+  try {
+    const w = epi_getEventWindow_(ev);
+    if (d.isAllDay) {
+      const st = epi_startOfDay_(d.start);
+      const en = epi_startOfDay_(d.end);
+      if (!w.isAllDay || w.start.getTime() !== st.getTime() || w.end.getTime() !== en.getTime()) {
+        ev.setAllDayDates(st, en);
+      }
+    } else {
+      const st = new Date(d.start);
+      const en = new Date(d.end);
+      if (w.isAllDay || w.start.getTime() !== st.getTime() || w.end.getTime() !== en.getTime()) {
+        ev.setTime(st, en);
+      }
+    }
+  } catch (e) {}
+
+  try {
+    ev.setDescription(epi_buildMetaDesc_(cfg, ss, sheet, d.row, d.taskName, d.hashObj, d.notePack));
+  } catch (e) {}
+
+  try {
+    const metaObj = epi_buildMetaObj_(ss, sheet, d.row, d.taskName, d.hashObj, d.notePack);
+    epi_setPrivateMeta_(cfg, ev, metaObj);
+  } catch (e) {}
+
+
+  // Lokasi event dari Google Maps (kolom C)
+  try {
+    const mapLoc = (d.notePack && d.notePack.mapUrl) ? String(d.notePack.mapUrl) : "";
+    ev.setLocation(mapLoc);
+  } catch (e) {}
+
+  epi_applyReminders_(cfg, ev, d.taskName);
+  epi_applyColor_(cfg, ev, d.taskName);
+}
+
+// ==============================
+// SYNC API (menu)
+// ==============================
+function episode_syncSelectedRow() {
+  epi_securityGuard_();
+
+  const cfg = epi_cfg_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = epi_getTimelineSheet_(ss, cfg);
+  if (!sheet) throw new Error(`Master Schedule sheet tidak ditemukan ("${cfg.TIMELINE_SHEET_NAME}").`);
+
+  if (ss.getActiveSheet().getName() !== sheet.getName()) {
+    throw new Error(`Pilih cell di sheet "${sheet.getName()}" lalu coba lagi.`);
+  }
+
+  const row = sheet.getActiveCell().getRow();
+  PropertiesService.getScriptProperties().setProperty(EP_SECURITY.ONLY_ROW_KEY, String(row));
+  return syncTasksToCalendar();
+}
+
+function episode_syncRowByPrompt() {
+  epi_securityGuard_();
+
+  const ui = epi_safeUi_();
+  if (!ui) throw new Error("Buka dari Google Sheets.");
+
+  const res = ui.prompt("Sync Row by Number", "Masukkan nomor row (angka) yang mau di-sync:", ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return "Canceled";
+
+  const n = parseInt(String(res.getResponseText() || "").trim(), 10);
+  if (!n || isNaN(n) || n < 1) throw new Error("Row tidak valid.");
+
+  PropertiesService.getScriptProperties().setProperty(EP_SECURITY.ONLY_ROW_KEY, String(n));
+  return syncTasksToCalendar();
+}
+
+// ==============================
+// MAIN SYNC (IDEMPOTENT)
+// ==============================
+function syncTasksToCalendar() {
+  epi_securityGuard_();
+
+  const cfg = epi_cfg_();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(25000)) throw new Error("Sync sedang berjalan di tempat lain. Coba lagi beberapa saat.");
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = epi_getTimelineSheet_(ss, cfg);
+    if (!sheet) throw new Error(`Master Schedule sheet tidak ditemukan ("${cfg.TIMELINE_SHEET_NAME}").`);
+
+    const calendar = epi_getCalendar_(cfg);
+    if (!calendar) throw new Error("Calendar ID tidak valid / tidak bisa diakses.");
+
+    try { if (cfg.CALENDAR_ID_CELL_A1) sheet.getRange(cfg.CALENDAR_ID_CELL_A1).setValue(cfg.CALENDAR_ID || ""); } catch (e) {}
+
+    const layout = epi_findGanttLayout_(sheet, cfg);
+    const headerRow = layout.headerRow;
+
+    const props = PropertiesService.getScriptProperties();
+    const onlyRowRaw = String(props.getProperty(EP_SECURITY.ONLY_ROW_KEY) || "").trim();
+    let onlyRow = null;
+
+    if (onlyRowRaw) {
+      props.deleteProperty(EP_SECURITY.ONLY_ROW_KEY);
+      const r = parseInt(onlyRowRaw, 10);
+      if (!r || isNaN(r)) throw new Error("ONLY_ROW invalid.");
+      if (r <= headerRow) throw new Error(`Row ${r} adalah header/di atas header (${headerRow}). Pilih row task.`);
+      onlyRow = r;
+    }
+
+    epi_notify_(cfg, "Episode Sync", `Reading Gantt… (mode ${onlyRow ? "ROW " + onlyRow : "FULL"})`, { kind: "INFO" });
+
+    const rangeStart = epi_addDays_(layout.minDate, -Math.max(0, cfg.SYNC_RANGE_DAYS_BEFORE));
+    const rangeEnd = epi_addDays_(layout.maxDate, Math.max(0, cfg.SYNC_RANGE_DAYS_AFTER));
+
+    // Desired objects (single source of truth)
+    const desiredPack = epi_buildDesiredFromGantt_(cfg, sheet, layout, onlyRow, null);
+    const desired = desiredPack.desired;
+    const desiredByCanonical = desiredPack.desiredByCanonical;
+    const desiredByAnyHash = desiredPack.desiredByAnyHash;
+
+const fileId = ss.getId();
+
+let existing = [];
+existing = calendar.getEvents(rangeStart, rangeEnd);
+
+
+    const keeperByCanonical = {};
+    const deleteQueue = [];
+
+for (let i = 0; i < existing.length; i++) {
+  const ev = existing[i];
+
+  // ambil metadata private (bukan dari description)
+  const meta = epi_getPrivateMeta_(cfg, ev);
+  if (!meta) continue; // bukan event Episode / meta gagal dibaca
+
+  // hanya event yang berasal dari spreadsheet ini
+  if (String(meta.fileId || "") !== String(fileId)) continue;
+
+  // kalau sync cuma 1 row
+  if (onlyRow && Number(meta.row) !== Number(onlyRow)) continue;
+
+  // kandidat hash untuk matching
+  const cands = [];
+  if (meta.hash) cands.push(meta.hash);
+  if (meta.hashV1) cands.push(meta.hashV1);
+  if (meta.hashV2) cands.push(meta.hashV2);
+
+  // fallback: hitung ulang dari title + window (biar tetap robust)
+  const cleanTitle = epi_titleClean_(cfg, ev.getTitle());
+  const w = epi_getEventWindow_(ev);
+  cands.push(epi_eventHashV1_(cleanTitle, w.start, w.end, w.isAllDay));
+  cands.push(epi_eventHashV2_(cfg, cleanTitle, w.start, w.end, w.isAllDay));
+
+  let canonical = "";
+  for (let k = 0; k < cands.length; k++) {
+    const h = cands[k];
+    if (h && desiredByAnyHash[h]) { canonical = desiredByAnyHash[h]; break; }
+  }
+
+  // obsolete -> delete
+  if (!canonical) {
+    deleteQueue.push(ev);
+    continue;
+  }
+
+  // duplicates -> delete
+  if (!keeperByCanonical[canonical]) keeperByCanonical[canonical] = ev;
+  else deleteQueue.push(ev);
+}
+
+    // Delete obsolete + duplicates
+    let deleted = 0;
+    for (let i = 0; i < deleteQueue.length; i++) {
+      if (deleted >= cfg.MAX_DELETE_PER_RUN) throw new Error(`Delete cap tercapai (>${cfg.MAX_DELETE_PER_RUN}). Stop untuk aman.`);
+      try { deleteQueue[i].deleteEvent(); deleted++; } catch (e) {}
+    }
+
+    // Update existing
+    let updated = 0;
+    for (const canonical in keeperByCanonical) {
+      const ev = keeperByCanonical[canonical];
+      const d = desiredByCanonical[canonical];
+      if (!d) continue;
+      epi_reconcileEventToDesired_(cfg, ev, d, ss, sheet);
+      updated++;
+    }
+    // Create missing
+    let created = 0;
+    for (let i = 0; i < desired.length; i++) {
+      const d = desired[i];
+      if (keeperByCanonical[d.canonical]) continue;
+
+      const createOpts = {
+        description: epi_buildMetaDesc_(cfg, ss, sheet, d.row, d.taskName, d.hashObj, d.notePack)
+      };
+
+      if (d.notePack && d.notePack.mapUrl) {
+        createOpts.location = String(d.notePack.mapUrl);
+      }
+
+      let ev;
+      if (d.isAllDay) ev = calendar.createAllDayEvent(d.title, d.start, d.end, createOpts);
+      else ev = calendar.createEvent(d.title, d.start, d.end, createOpts);
+
+      epi_applyReminders_(cfg, ev, d.taskName);
+      epi_applyColor_(cfg, ev, d.taskName);
+      try {
+  const metaObj = epi_buildMetaObj_(ss, sheet, d.row, d.taskName, d.hashObj, d.notePack);
+  epi_setPrivateMeta_(cfg, ev, metaObj);
+} catch (e) {}
+
+
+      created++;
+      if (created >= cfg.MAX_EVENTS_PER_RUN) break;
+    }
+
+    const calendarName = calendar.getName();
+    const msg =
+      `${cfg.APP_NAME || "Episode"} - Gantt Sync Result\n\n` +
+      `Calendar: "${calendarName}"\n` +
+      `Sheet: "${sheet.getName()}"\n` +
+      `Header row: ${layout.headerRow}\n` +
+      `Date range: ${layout.minDate.toDateString()} -> ${layout.maxDate.toDateString()}\n` +
+      `Mode: ${onlyRow ? ("Row " + onlyRow) : "FULL"}\n` +
+      `Hash mode: ${cfg.HASH_VERSION}\n\n` +
+      `Created: ${created}\n` +
+      `Updated: ${updated}\n` +
+      `Deleted: ${deleted}\n` +
+      `Desired now: ${desired.length}\n` +
+      `Version: ${EP_VERSION}`;
+
+    props.setProperty(EP_SECURITY.LAST_SYNC_TIME_KEY, Utilities.formatDate(new Date(), cfg.TIMEZONE, "yyyy-MM-dd HH:mm:ss"));
+    props.setProperty(EP_SECURITY.LAST_SYNC_SUMMARY_KEY, `C:${created} U:${updated} D:${deleted} (Desired:${desired.length})`);
+
+    epi_log_("INFO", "SYNC_OK", "Sync completed", {
+      created, updated, deleted, desired: desired.length,
+      mode: onlyRow ? onlyRow : "FULL",
+      hashMode: cfg.HASH_VERSION,
+      version: EP_VERSION
+    });
+    epi_notify_(cfg, "Sync Done", `Created ${created}, Updated ${updated}, Deleted ${deleted}, Desired ${desired.length}`, { kind: "SYNC" });
+
+    epi_alertSafe_(cfg.APP_NAME || "Episode", msg);
+    return msg;
+
+  } catch (e) {
+    const msg = (e && e.message) ? e.message : String(e);
+    epi_setLastError_("Sync error:\n" + msg);
+    epi_log_("ERROR", "SYNC_FAIL", "Sync failed", { error: msg, version: EP_VERSION }, e && e.stack ? e.stack : "");
+    epi_notify_(cfg, "Sync Error", msg, { kind: "ERROR" });
+    throw e;
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+// ==============================
+// BUILD DESIRED (Single source of truth)
+// ==============================
+function epi_buildDesiredFromGantt_(cfg, sheet, layout, onlyRow, maxRowsScan) {
+  const desired = [];
+  const desiredByCanonical = {};
+  const desiredByAnyHash = {};
+
+  const firstRow = onlyRow ? onlyRow : layout.firstTaskRow;
+  const lastRowRaw = onlyRow ? onlyRow : layout.lastTaskRow;
+
+  const scanMax = (maxRowsScan === null || maxRowsScan === undefined || String(maxRowsScan).trim() === "")
+    ? null
+    : Math.max(1, epi_toNum_(maxRowsScan, 1500));
+
+  const totalRows = (lastRowRaw - firstRow + 1);
+  const scanRows = scanMax ? Math.min(totalRows, scanMax) : totalRows;
+  const truncated = scanMax ? (scanRows < totalRows) : false;
+
+  const dateCols = layout.dateCols;
+  const dates = layout.dates;
+  const maxCol = Math.max.apply(null, dateCols);
+
+  // Baca minimal sampai kolom C (notes)
+  const readMaxCol = Math.max(maxCol, 3);
+  const data = sheet.getRange(firstRow, 1, scanRows, readMaxCol).getValues();
+
+  for (let idx = 0; idx < data.length; idx++) {
+    const rowNum = firstRow + idx;
+
+    const parsed = epi_taskParse_(data[idx][0]);
+    const taskName = parsed.name;
+    const notePack = epi_parseNotesCell_(data[idx][2]); // kolom C
+
+    if (!taskName) continue;
+    if (parsed.del) continue;
+
+    const activeDates = [];
+    for (let k = 0; k < dateCols.length; k++) {
+      const col = dateCols[k];
+      const cellVal = data[idx][col - 1];
+      const s = String(cellVal || "").trim();
+      if (!s) continue;
+      if (!cfg.GANTT_MARKER_REGEX_RE.test(s)) continue;
+      activeDates.push(dates[k]);
+    }
+    if (!activeDates.length) continue;
+
+    const segs = epi_groupDatesIntoSegments_(activeDates, cfg);
+    const time = epi_timeBracket_(taskName, cfg);
+
+    for (let si = 0; si < segs.length; si++) {
+      const segStart = segs[si].start;
+      const segEndInc = segs[si].end;
+
+      const isSingleDay = (epi_daysDiff_(segStart, segEndInc) === 0);
+
+      let isAllDay = true;
+      let start = segStart;
+      let end = epi_addDays_(segEndInc, 1); // exclusive
+
+      // Only timed if single-day segment AND bracket exists
+      if (time && isSingleDay) {
+        isAllDay = false;
+        start = new Date(segStart); start.setHours(time.sh, time.sm, 0, 0);
+        end = new Date(segStart); end.setHours(time.eh, time.em, 0, 0);
+        if (end.getTime() < start.getTime()) end = epi_addDays_(end, 1);
+      }
+
+      const title = String(cfg.EVENT_PREFIX || "") + taskName;
+      const hashObj = epi_hashPack_(cfg, taskName, start, end, isAllDay);
+      const canonical = hashObj.active;
+
+      const obj = {
+        canonical,
+        title,
+        start,
+        end,
+        isAllDay,
+        row: rowNum,
+        taskName,
+        hashObj,
+        notePack
+      };
+
+      if (desiredByCanonical[canonical]) {
+        const p = desiredByCanonical[canonical];
+        const clash =
+          p.row !== obj.row ||
+          p.isAllDay !== obj.isAllDay ||
+          p.start.getTime() !== obj.start.getTime() ||
+          p.end.getTime() !== obj.end.getTime();
+
+        if (clash) {
+          throw new Error(
+            "HASH COLLISION DETECTED.\n\n" +
+            "2 task berbeda menghasilkan canonical hash yang sama.\n" +
+            "Biasanya karena nama task sama + tanggal/jam sama.\n\n" +
+            `Hash: ${canonical}\n` +
+            `A: row ${p.row} - ${p.taskName}\n` +
+            `B: row ${obj.row} - ${obj.taskName}\n\n` +
+            "Solusi: bedakan nama task (suffix #1/#2 atau kode client)."
+          );
+        }
+      } else {
+        desiredByCanonical[canonical] = obj;
+        desired.push(obj);
+
+        const addKey = (h) => {
+          if (!h) return;
+          if (desiredByAnyHash[h] && desiredByAnyHash[h] !== canonical) {
+            throw new Error(
+              "HASH MAP COLLISION.\n\n" +
+              "Satu hash non-canonical menunjuk ke dua canonical berbeda.\n\n" +
+              `Hash: ${h}\n` +
+              `A: ${desiredByAnyHash[h]}\n` +
+              `B: ${canonical}`
+            );
+          }
+          desiredByAnyHash[h] = canonical;
+        };
+
+        addKey(canonical);
+        if (cfg.HASH_COMPAT_ACCEPT_V1) addKey(hashObj.v1);
+        if (cfg.HASH_COMPAT_ACCEPT_V2) addKey(hashObj.v2);
+      }
+
+      if (desired.length > cfg.MAX_EVENTS_PER_RUN) {
+        throw new Error(
+          `Terlalu banyak event dalam 1 run (>${cfg.MAX_EVENTS_PER_RUN}).\n` +
+          "Tips: sync per-row atau kurangi marker."
+        );
+      }
+    }
+  }
+
+  return {
+    desired,
+    desiredByCanonical,
+    desiredByAnyHash,
+    truncated,
+    scanRowsMax: scanMax || null
+  };
+}
+
+// ==============================
+// QUICK STATUS + DIAGNOSTICS + SELFTEST
+// ==============================
+function episode_statusSummary() {
+  try {
+    const cfg = epi_cfg_();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const who = epi_getCallerEmail_();
+
+    const sheet = ss.getSheetByName(cfg.TIMELINE_SHEET_NAME);
+    const ownerChk = epi_getOwnerAllowCheck_();
+    const lockInfo = epi_getLockInfo_();
+
+    let calLine = "(not resolved)";
+    let calName = "";
+    const cal = epi_getCalendar_(cfg);
+    if (cal) {
+      calName = cal.getName();
+      calLine = cfg.CALENDAR_ID ? cfg.CALENDAR_ID : "(default calendar)";
+    } else {
+      calLine = cfg.CALENDAR_ID ? `${cfg.CALENDAR_ID} (unreachable)` : "(default unreachable)";
+    }
+
+    const trig = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction && t.getHandlerFunction() === EP_SECURITY.INSTALL_TRIGGER_HANDLER);
+
+    const props = PropertiesService.getScriptProperties();
+    const lastSyncTime = String(props.getProperty(EP_SECURITY.LAST_SYNC_TIME_KEY) || "");
+    const lastSyncSum = String(props.getProperty(EP_SECURITY.LAST_SYNC_SUMMARY_KEY) || "");
+
+    const lines = [];
+    lines.push(cfg.COMPANY_LINE || "");
+    lines.push("");
+    lines.push(`Episode Version: ${EP_VERSION}`);
+    lines.push(`Hash mode: ${cfg.HASH_VERSION}`);
+    lines.push("");
+
+    lines.push(`Locked: ${lockInfo.locked ? "YES" : "NO"}`);
+    if (lockInfo.locked) {
+      if (lockInfo.time) lines.push(`Locked time: ${lockInfo.time}`);
+      if (lockInfo.reason) lines.push(`Lock reason: ${lockInfo.reason}`);
+      lines.push("");
+    }
+
+    lines.push(`Effective: ${who.effective || "(unknown)"}`);
+    lines.push(`Active:    ${who.active || "(unknown)"}`);
+    lines.push("");
+
+    lines.push(`File owner:   ${ownerChk.containerOwnerEmail || "(unreadable)"}`);
+    lines.push(`Script owner: ${ownerChk.scriptOwnerEmail || "(unreadable)"}`);
+    lines.push(`Owner ok:     ${ownerChk.ok ? "YES" : "NO"} (${ownerChk.status})`);
+    if (ownerChk.error) lines.push(`Owner err:    ${ownerChk.error}`);
+    lines.push("");
+
+    lines.push(`Master Schedule sheet: ${sheet ? sheet.getName() : "(missing)"}`);
+    lines.push(`Calendar ID:           ${calLine}`);
+    if (calName) lines.push(`Calendar name:         ${calName}`);
+
+    if (sheet) {
+      try {
+        const layout = epi_findGanttLayout_(sheet, cfg);
+        lines.push("");
+        lines.push(`Gantt header row:      ${layout.headerRow}`);
+        lines.push(`Tasks rows:            ${layout.firstTaskRow} -> ${layout.lastTaskRow}`);
+        lines.push(`Dates found:           ${layout.dates.length}`);
+      } catch (e) {
+        lines.push("");
+        lines.push(`Gantt layout:          ERROR - ${(e && e.message) ? e.message : e}`);
+      }
+    }
+
+    lines.push("");
+    lines.push(`Installed trigger: ${trig ? "YES" : "NO"}`);
+
+    lines.push("");
+    lines.push(`Last sync: ${lastSyncTime || "(none)"}`);
+    lines.push(`Last sync summary: ${lastSyncSum || "(none)"}`);
+
+    const lastErr = epi_getLastError_();
+    lines.push("");
+    lines.push(`Last error saved: ${lastErr ? "YES" : "NO"}`);
+
+    return lines.join("\n");
+  } catch (e) {
+    return "Status failed: " + (e && e.message ? e.message : e);
+  }
+}
+
+function episode_showQuickStatus() {
+  epi_securityGuard_();
+  const s = episode_statusSummary();
+  epi_alertSafe_("Quick Status", s);
+  return s;
+}
+
+function episode_diagnostics(silentReturnText) {
+  epi_securityGuard_();
+
+  const cfg = epi_cfg_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const who = epi_getCallerEmail_();
+  const ownerChk = epi_getOwnerAllowCheck_();
+
+  const sheet = ss.getSheetByName(cfg.TIMELINE_SHEET_NAME);
+  const trig = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction && t.getHandlerFunction() === EP_SECURITY.INSTALL_TRIGGER_HANDLER);
+
+  const lines = [];
+  const ok = (label, detail) => lines.push(`✅ ${label}${detail ? " - " + detail : ""}`);
+  const no = (label, detail) => lines.push(`❌ ${label}${detail ? " - " + detail : ""}`);
+
+  ok("Spreadsheet", ss.getName());
+  ok("Episode version", EP_VERSION);
+  ok("Hash mode", cfg.HASH_VERSION);
+
+  ok("Caller (effective)", who.effective || "(unknown)");
+  ok("Caller (active)", who.active || "(unknown)");
+
+  if (ownerChk.status === "UNREADABLE") no("Owner readable", ownerChk.error || "Unknown");
+  else if (ownerChk.ok) ok("Owner allowlist", ownerChk.containerOwnerEmail || ownerChk.scriptOwnerEmail || "(fallback)");
+  else no("Owner allowlist", (ownerChk.containerOwnerEmail || ownerChk.scriptOwnerEmail || "(unreadable)"));
+
+  if (sheet) ok("Master Schedule sheet", sheet.getName());
+  else no("Master Schedule sheet", `"${cfg.TIMELINE_SHEET_NAME}" not found`);
+
+  if (sheet) {
+    try {
+      const layout = epi_findGanttLayout_(sheet, cfg);
+      ok("Gantt header found", `Row ${layout.headerRow}, dates=${layout.dates.length}, tasks=${layout.firstTaskRow} -> ${layout.lastTaskRow}`);
+    } catch (e) {
+      no("Gantt layout", (e && e.message) ? e.message : e);
+    }
+  }
+
+  const cal = epi_getCalendar_(cfg);
+  if (cal) ok("Calendar access", `${cal.getName()} (${cfg.CALENDAR_ID || "default"})`);
+  else no("Calendar access", `Cannot access (${cfg.CALENDAR_ID || "default"})`);
+
+  if (trig) ok("Installed trigger", "Present");
+  else no("Installed trigger", "Not installed (recommended) - Setup -> Install");
+
+  const lastErr = epi_getLastError_();
+  if (lastErr) ok("Last error stored", "YES (use 'Show Last Error')");
+  else ok("Last error stored", "NO");
+
+  const out =
+    lines.join("\n") +
+    "\n\nDETAIL:\n" +
+    `Effective: ${who.effective || "(unknown)"}\n` +
+    `Active: ${who.active || "(unknown)"}\n` +
+    `File owner: ${ownerChk.containerOwnerEmail || "(unreadable)"}\n` +
+    `Script owner: ${ownerChk.scriptOwnerEmail || "(unreadable)"}\n` +
+    (ownerChk.error ? `Owner check error: ${ownerChk.error}\n` : "");
+
+  epi_log_("INFO", "DIAGNOSTICS", "Diagnostics executed", { okCount: lines.filter(x => x.startsWith("✅")).length, version: EP_VERSION });
+
+  if (silentReturnText) return out;
+  epi_alertSafe_("Episode Diagnostics", out);
+  return "Diagnostics shown";
+}
+
+function episode_showLastError() {
+  epi_securityGuard_();
+  const last = epi_getLastError_();
+  if (!last) { epi_alertSafe_("Last Error", "Tidak ada error tersimpan."); return "No last error"; }
+  epi_alertSafe_("Last Error", last);
+  return "Shown";
+}
+
+function episode_verifyLicense() {
+  epi_securityGuard_();
+  const cfg = epi_cfg_();
+  epi_alertSafe_(cfg.APP_NAME || "Episode", "License OK.\n\nOwner file terverifikasi allowlist.");
+  return "OK";
+}
+
+// ==============================
+// SELFTEST (Safe)
+// ==============================
+function episode_selftest(silentReturnText) {
+  epi_securityGuard_();
+
+  const cfg = epi_cfg_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const who = epi_getCallerEmail_();
+  const ownerChk = epi_getOwnerAllowCheck_();
+  const lockInfo = epi_getLockInfo_();
+
+  const nowStr = Utilities.formatDate(new Date(), cfg.TIMEZONE || "Asia/Jakarta", "yyyy-MM-dd HH:mm:ss");
+
+  const lines = [];
+  const ok = (label, detail) => lines.push(`✅ ${label}${detail ? " - " + detail : ""}`);
+  const warn = (label, detail) => lines.push(`⚠️ ${label}${detail ? " - " + detail : ""}`);
+  const no = (label, detail) => lines.push(`❌ ${label}${detail ? " - " + detail : ""}`);
+
+  lines.push(cfg.COMPANY_LINE || "");
+  lines.push("");
+  lines.push("SELFTEST REPORT");
+  lines.push(`Time: ${nowStr}`);
+  lines.push(`Version: ${EP_VERSION}`);
+  lines.push(`Hash mode: ${cfg.HASH_VERSION}`);
+  lines.push("");
+
+  if (lockInfo.locked) no("App locked", lockInfo.reason || "(no reason recorded)");
+  else ok("App locked", "NO");
+
+  if (ownerChk.status === "UNREADABLE") no("Owner check", ownerChk.error || "UNREADABLE (authorize Drive scope)");
+  else if (ownerChk.ok) ok("License", ownerChk.containerOwnerEmail || ownerChk.scriptOwnerEmail || "(fallback)");
+  else no("License", (ownerChk.containerOwnerEmail || ownerChk.scriptOwnerEmail || "(unreadable)"));
+
+  ok("Caller (effective)", who.effective || "(unknown)");
+  ok("Caller (active)", who.active || "(unknown)");
+
+  // Setup sheet integrity
+  const setupSh = ss.getSheetByName(EP_SETUP_SHEET);
+  if (!setupSh) {
+    warn("Setup sheet", `${EP_SETUP_SHEET} missing (owner: run Setup -> Initialize)`);
+  } else {
+    ok("Setup sheet", EP_SETUP_SHEET);
+    try {
+      const vals = setupSh.getDataRange().getValues();
+      const seen = {};
+      const dups = [];
+      for (let i = 1; i < vals.length; i++) {
+        const k = String(vals[i][0] || "").trim();
+        if (!k) continue;
+        if (seen[k]) dups.push(k);
+        seen[k] = true;
+      }
+      const missing = [];
+      for (let i = 0; i < EP_DEFAULT_SETTINGS.length; i++) {
+        const k = String(EP_DEFAULT_SETTINGS[i][0] || "").trim();
+        if (k && !seen[k]) missing.push(k);
+      }
+
+      if (dups.length) warn("Setup keys duplicate", dups.slice(0, 15).join(", ") + (dups.length > 15 ? " ..." : ""));
+      else ok("Setup keys duplicate", "NO");
+
+      if (missing.length) warn("Setup keys missing", missing.slice(0, 15).join(", ") + (missing.length > 15 ? " ..." : ""));
+      else ok("Setup keys missing", "NO");
+    } catch (e) {
+      warn("Setup sheet scan", (e && e.message) ? e.message : String(e));
+    }
+  }
+
+  // Log sheet access
+  try {
+    const logSh = epi_ensureLogSheet_();
+    if (logSh) ok("Diagnostics log sheet", EP_LOG_SHEET);
+    else warn("Diagnostics log sheet", "Cannot access/create");
+  } catch (e) {
+    warn("Diagnostics log sheet", (e && e.message) ? e.message : String(e));
+  }
+
+  // Timeline + Gantt layout
+  const timeline = ss.getSheetByName(cfg.TIMELINE_SHEET_NAME);
+  let layout = null;
+
+  if (!timeline) {
+    warn("Timeline sheet", `"${cfg.TIMELINE_SHEET_NAME}" not found`);
+  } else {
+    ok("Timeline sheet", timeline.getName());
+    try {
+      layout = epi_findGanttLayout_(timeline, cfg);
+      ok("Gantt layout", `Header row ${layout.headerRow}, dates ${layout.dates.length}, tasks ${layout.firstTaskRow} -> ${layout.lastTaskRow}`);
+    } catch (e) {
+      warn("Gantt layout", (e && e.message) ? e.message : String(e));
+    }
+  }
+
+  // Calendar access
+  let cal = null;
+  try {
+    cal = epi_getCalendar_(cfg);
+    if (!cal) warn("Calendar access", `Cannot access (${cfg.CALENDAR_ID || "default"})`);
+    else ok("Calendar access", `${cal.getName()} (${cfg.CALENDAR_ID || "default"})`);
+  } catch (e) {
+    warn("Calendar access", (e && e.message) ? e.message : String(e));
+  }
+
+  // Installed trigger
+  try {
+    const trig = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction && t.getHandlerFunction() === EP_SECURITY.INSTALL_TRIGGER_HANDLER);
+    if (trig) ok("Installed trigger", "Present");
+    else warn("Installed trigger", "Not installed (recommended) - Setup -> Install");
+  } catch (e) {
+    warn("Installed trigger", (e && e.message) ? e.message : String(e));
+  }
+
+  // Optional calendar write test
+  if (cal) {
+    if (cfg.SELFTEST_CALENDAR_WRITE) {
+      try {
+        const d = new Date();
+        d.setDate(d.getDate() + 1);
+        d.setHours(7, 10, 0, 0);
+        const end = new Date(d.getTime());
+        end.setMinutes(end.getMinutes() + 10);
+
+        const title = `${cfg.SELFTEST_EVENT_TITLE || "Episode Selftest (auto-delete)"} - ${Utilities.getUuid().slice(0, 8)}`;
+        const ev = cal.createEvent(title, d, end, { description: "Selftest event. Auto-delete in script." });
+        ev.deleteEvent();
+        ok("Calendar write test", "PASS (create+delete OK)");
+      } catch (e) {
+        warn("Calendar write test", (e && e.message) ? e.message : String(e));
+      }
+    } else {
+      ok("Calendar write test", "SKIPPED (SELFTEST_CALENDAR_WRITE=FALSE)");
+    }
+  }
+
+  // Dry-run plan sync (read-only)
+  if (cfg.SELFTEST_DRYRUN_PLAN_SYNC) {
+    if (timeline && cal && layout) {
+      try {
+        const plan = epi_planSyncDryRun_(cfg, ss, timeline, cal, layout, null);
+        ok("Dry-run sync plan",
+          `Desired ${plan.desiredCount}, ExistingTagged ${plan.existingTaggedCount}, Create ${plan.wouldCreate}, Update ${plan.wouldUpdate}, Delete ${plan.wouldDelete}` +
+          (plan.truncated ? `, TruncatedScan YES (max ${plan.scanRowsMax})` : "")
+        );
+
+        if (plan.desiredCount > cfg.MAX_EVENTS_PER_RUN) warn("Desired cap", `Desired ${plan.desiredCount} > MAX_EVENTS_PER_RUN ${cfg.MAX_EVENTS_PER_RUN}`);
+        if (plan.wouldDelete > cfg.MAX_DELETE_PER_RUN) warn("Delete cap", `WouldDelete ${plan.wouldDelete} > MAX_DELETE_PER_RUN ${cfg.MAX_DELETE_PER_RUN}`);
+      } catch (e) {
+        warn("Dry-run sync plan", (e && e.message) ? e.message : String(e));
+      }
+    } else {
+      warn("Dry-run sync plan", "SKIPPED (need Timeline + Calendar + valid Gantt layout)");
+    }
+  } else {
+    ok("Dry-run sync plan", "SKIPPED (SELFTEST_DRYRUN_PLAN_SYNC=FALSE)");
+  }
+
+  const out = lines.join("\n");
+
+  try {
+    epi_log_("INFO", "SELFTEST", "Selftest executed", {
+      version: EP_VERSION,
+      time: nowStr,
+      calendarWrite: cfg.SELFTEST_CALENDAR_WRITE,
+      dryRun: cfg.SELFTEST_DRYRUN_PLAN_SYNC
+    });
+  } catch (e) {}
+
+  if (silentReturnText) return out;
+  epi_alertSafe_("Episode Selftest", out);
+  return out;
+}
+
+function epi_planSyncDryRun_(cfg, ss, sheet, calendar, layout, onlyRow) {
+  const rangeStart = epi_addDays_(layout.minDate, -Math.max(0, cfg.SYNC_RANGE_DAYS_BEFORE));
+  const rangeEnd = epi_addDays_(layout.maxDate, Math.max(0, cfg.SYNC_RANGE_DAYS_AFTER));
+
+  const desiredPack = epi_buildDesiredFromGantt_(cfg, sheet, layout, onlyRow, cfg.SELFTEST_MAX_TASK_ROWS_SCAN);
+  const desired = desiredPack.desired;
+  const desiredByCanonical = desiredPack.desiredByCanonical;
+  const desiredByAnyHash = desiredPack.desiredByAnyHash;
+
+  const fileId = ss.getId();
+
+  // NOTE: Kita tidak pakai description tagging lagi.
+  // Semua identifikasi event Episode dilakukan lewat extendedProperties.private (Calendar API).
+  let existing = [];
+  existing = calendar.getEvents(rangeStart, rangeEnd);
+
+  const keeperByCanonical = {};
+  const deleteQueue = [];
+  let existingTaggedCount = 0;
+
+  for (let i = 0; i < existing.length; i++) {
+    const ev = existing[i];
+
+    // Ambil metadata private (bukan dari description)
+    const meta = epi_getPrivateMeta_(cfg, ev);
+    if (!meta) continue; // bukan event Episode atau meta gagal dibaca
+
+    // Hanya event yang berasal dari spreadsheet ini
+    if (String(meta.fileId || "") !== String(fileId)) continue;
+
+    existingTaggedCount++;
+
+    // Kalau mode dry-run cuma 1 row
+    if (onlyRow && Number(meta.row) !== Number(onlyRow)) continue;
+
+    // Kandidat hash untuk matching (meta dulu)
+    const cands = [];
+    if (meta.hash) cands.push(meta.hash);
+    if (meta.hashV1) cands.push(meta.hashV1);
+    if (meta.hashV2) cands.push(meta.hashV2);
+
+    // Fallback: hitung ulang dari title + window (biar tetap robust)
+    const cleanTitle = epi_titleClean_(cfg, ev.getTitle());
+    const w = epi_getEventWindow_(ev);
+    cands.push(epi_eventHashV1_(cleanTitle, w.start, w.end, w.isAllDay));
+    cands.push(epi_eventHashV2_(cfg, cleanTitle, w.start, w.end, w.isAllDay));
+
+    // Temukan canonical hash yang cocok ke desired
+    let canonical = "";
+    for (let k = 0; k < cands.length; k++) {
+      const h = cands[k];
+      if (h && desiredByAnyHash[h]) { canonical = desiredByAnyHash[h]; break; }
+    }
+
+    // Kalau tidak ada match, berarti obsolete di Gantt sekarang (akan dihapus saat real sync)
+    if (!canonical) {
+      deleteQueue.push(ev);
+      continue;
+    }
+
+    // Kalau ada duplikat canonical, 1 keeper, sisanya delete
+    if (!keeperByCanonical[canonical]) keeperByCanonical[canonical] = ev;
+    else deleteQueue.push(ev);
+  }
+
+  const keepCount = Object.keys(keeperByCanonical).length;
+  const wouldDelete = deleteQueue.length;
+
+  // Dry-run: kita anggap semua keeper "wouldUpdate" karena reconcile akan dipanggil di real sync.
+  // Ini aman untuk estimasi. Kalau kamu mau hitung "update beneran vs no-op", itu butuh diff detail dan bakal lebih lambat.
+  const wouldUpdate = keepCount;
+
+  // Create = desired yang belum punya keeper
+  let wouldCreate = desired.length - keepCount;
+  if (wouldCreate < 0) wouldCreate = 0;
+
+  return {
+    desiredCount: desired.length,
+    existingTaggedCount: existingTaggedCount,
+    wouldCreate: wouldCreate,
+    wouldUpdate: wouldUpdate,
+    wouldDelete: wouldDelete,
+    truncated: !!desiredPack.truncated,
+    scanRowsMax: desiredPack.scanRowsMax
+  };
+}
+
+function epi_eventNeedsUpdate_(cfg, ev, d, ss, sheet) {
+  try {
+    if (String(ev.getTitle() || "") !== String(d.title || "")) return true;
+  } catch (e) { return true; }
+
+  try {
+    const w = epi_getEventWindow_(ev);
+    if (d.isAllDay) {
+      const st = epi_startOfDay_(d.start);
+      const en = epi_startOfDay_(d.end);
+      if (!w.isAllDay) return true;
+      if (w.start.getTime() !== st.getTime()) return true;
+      if (w.end.getTime() !== en.getTime()) return true;
+    } else {
+      const st = new Date(d.start);
+      const en = new Date(d.end);
+      if (w.isAllDay) return true;
+      if (w.start.getTime() !== st.getTime()) return true;
+      if (w.end.getTime() !== en.getTime()) return true;
+    }
+  } catch (e) { return true; }
+
+  try {
+    const desc = String(ev.getDescription() || "");
+    const expectedDesc = epi_buildMetaDesc_(cfg, ss, sheet, d.row, d.taskName, d.hashObj, d.notePack);
+    if (desc !== expectedDesc) return true;
+  } catch (e) { return true; }
+
+  try {
+    const evLoc = String(ev.getLocation ? (ev.getLocation() || "") : "").trim();
+    const wantLoc = String((d.notePack && d.notePack.mapUrl) ? d.notePack.mapUrl : "").trim();
+    if (evLoc !== wantLoc) return true;
+  } catch (e) { return true; }
+
+  return false;
+}
+
+// ==============================
+// DEV / DANGER ZONE (OWNER ONLY)
+// ==============================
+function dev_UnlockAllSheets() {
+  epi_securityGuard_();
+  epi_requireAllowlistedUser_();
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
+
+  let unhidden = 0;
+  let protRemoved = 0;
+
+  sheets.forEach(sh => {
+    try {
+      if (sh.isSheetHidden()) { sh.showSheet(); unhidden++; }
+    } catch (e) {}
+
+    try {
+      const prots = sh.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+      prots.forEach(p => {
+        try { p.remove(); protRemoved++; } catch (e) {}
+      });
+    } catch (e) {}
+
+    try {
+      const rProts = sh.getProtections(SpreadsheetApp.ProtectionType.RANGE);
+      rProts.forEach(p => {
+        try { p.remove(); protRemoved++; } catch (e) {}
+      });
+    } catch (e) {}
+  });
+
+  const msg = `Unlock attempted.\n\nSheets unhidden: ${unhidden}\nProtections removed: ${protRemoved}`;
+  epi_log_("WARN", "DEV_UNLOCK", "Dev unlock all sheets executed", { unhidden, protRemoved, version: EP_VERSION });
+  epi_alertSafe_("Dev: Unlock All Sheets", msg);
+  return msg;
+}
